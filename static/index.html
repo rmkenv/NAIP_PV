@@ -161,7 +161,6 @@
     fd.append('conf', params.conf);
     fd.append('iou', params.iou);
     fd.append('imgsz', params.imgsz);
-    // Include augment and sharpen in form data for API - be sure backend supports these parameters
     fd.append('augment', params.augment);
     fd.append('sharpen', params.sharpen);
 
@@ -174,7 +173,7 @@
     const resultMapEl = document.getElementById('result_map');
     resultMapEl.style.display = 'block';
 
-    // If map already exists, remove it before creating new to avoid layering issues
+    // Remove previous map if exists
     if (window.resultMap) {
       window.resultMap.remove();
     }
@@ -194,7 +193,6 @@
     document.getElementById('imgsz').value = 1536;
     document.getElementById('conf').value = 0.15;
     document.getElementById('iou').value = 0.45;
-    // Ensure width_px is at least 2048, max 3000
     let currentWidth = Number(document.getElementById('width_px').value) || 2048;
     currentWidth = Math.min(3000, Math.max(2048, currentWidth));
     document.getElementById('width_px').value = currentWidth;
@@ -228,7 +226,7 @@
       const data = await postInferNAIP(bounds, params);
       if (data.error) throw new Error(data.error);
 
-      imgEl.src = data.image_data_url; // still show static result
+      imgEl.src = data.image_data_url;
       imgEl.style.display = 'block';
 
       showResultOnMap(data, bounds);
