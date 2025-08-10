@@ -1,328 +1,201 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Solar Panel Detector - Generic Imagery</title>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css" />
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css" />
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/esri-leaflet/3.0.11/esri-leaflet.min.js"></script>
-  <style>
-    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
-    #app { display: grid; grid-template-columns: 360px 1fr; height: 100vh; }
-    #sidebar { padding: 16px; overflow-y: auto; border-right: 1px solid #e5e7eb; }
-    #map { width: 100%; height: 55%; border-bottom: 1px solid #e5e7eb; }
-    #results { height: 45%; overflow: auto; padding: 12px; }
-    .section { margin-bottom: 18px; }
-    .section h4 { margin: 10px 0 8px; font-size: 14px; color: #111827; }
-    label { display: block; font-size: 13px; margin: 6px 0 4px; color: #374151; }
-    input[type="text"], input[type="number"] { width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 6px; }
-    button { padding: 8px 10px; margin: 6px 6px 0 0; border: 1px solid #d1d5db; background: #111827; color: white; border-radius: 6px; cursor: pointer; }
-    button.secondary { background: white; color: #111827; }
-    .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-    .note { font-size: 12px; color: #6b7280; margin-top: 6px; }
-    #resultImage { max-width: 100%; border: 1px solid #e5e7eb; border-radius: 6px; }
-    .stat { font-size: 13px; color: #111827; margin: 4px 0; }
-    .pill { display: inline-block; font-size: 11px; border: 1px solid #d1d5db; border-radius: 9999px; padding: 2px 8px; margin-right: 6px; background: #f3f4f6; }
-    #sourceNote { margin-top: 6px; font-size: 12px; color: #374151; background: #fff7ed; border: 1px solid #fdba74; padding: 8px; border-radius: 6px; display:none; }
-  </style>
-</head>
-<body>
-  <div id="app">
-    <div id="sidebar">
-      <div class="section">
-        <h3>Solar Panel Detector</h3>
-        <div class="note">Draw a bounding box on the map, then choose a source to run the model.</div>
-      </div>
+<!-- Map-based NAIP fetch and inference with enhanced UX (with augment+sharpen+High Recall) -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+<style>
+  #map { height: 520px; margin: 10px 0; }
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; margin: 8px 0; align-items: center; }
+  .controls label { font-size: 14px; }
+  .hint { color:#444; font-size: 13px; margin-top: 4px; }
+  .row { display:flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  #result_panel { display: grid; grid-template-columns: 360px 1fr; gap: 10px; align-items: start; }
+  #result_img { width: 100%; display:none; border: 1px solid #ddd; border-radius: 6px; }
+  #result_map { height: 520px; display:none; border: 1px solid #ddd; border-radius: 6px; }
+  .badge { display:inline-block; padding:2px 6px; border-radius:10px; background:#eef; color:#334; font-size:12px; margin-left:6px; }
+</style>
 
-      <div class="section">
-        <h4>1) Draw Area</h4>
-        <div class="note">Use the rectangle tool to draw a bbox. You can edit or delete it.</div>
-        <div id="bboxInfo" class="note">No bbox selected.</div>
-        <div class="row">
-          <button id="fitUSA" class="secondary">Zoom to USA</button>
-          <button id="clearBbox" class="secondary">Clear bbox</button>
-        </div>
-      </div>
+<div>
+  <h3>Draw a box anywhere in the U.S. to fetch NAIP and detect panels</h3>
+  <div id="map"></div>
 
-      <div class="section">
-        <h4>2) Imagery Options</h4>
-        <label for="serviceUrl">Imagery Service URL (Esri ImageServer, MapServer, or WMS)</label>
-        <input type="text" id="serviceUrl" placeholder="Paste an Esri ImageServer / MapServer / WMS URL" />
-        <label for="wmsLayer">WMS Layer name (optional)</label>
-        <input type="text" id="wmsLayer" placeholder="Only needed for WMS if auto-pick fails" />
-        <label for="targetMpp">Target meters/pixel (optional)</label>
-        <input type="number" id="targetMpp" step="0.01" min="0.05" max="5" placeholder="e.g., 0.3 for 30 cm" />
-        <div class="note">Typical high-res values range from 0.15–0.6 m/px. Leave blank to let the server choose a size. Some servers reject very fine pixel sizes or large bbox/windows.</div>
-        <div id="sourceNote"></div>
-        <div class="row">
-          <button id="btnMD" type="button" class="secondary">MD Six-Inch</button>
-          <button id="btnNY" type="button" class="secondary">NY Latest (WMS)</button>
-          <button id="btnVA" type="button" class="secondary">VA VBMP Infrared</button>
-        </div>
-        <div class="row">
-          <button id="previewBtn" type="button">Preview on Map</button>
-          <button id="runGeneric" type="button">Run Model (Generic)</button>
-        </div>
-        <div class="note">Notes: Some services restrict export resolution or format. If you get an error, try a slightly smaller bbox, a larger target m/px (coarser), or leave target m/px blank so we request default server size. Infrared imagery may reduce model accuracy.</div>
-      </div>
-
-      <div class="section">
-        <h4>3) NAIP (fallback)</h4>
-        <div class="row">
-          <button id="runNAIPUSGS" type="button" class="secondary">Run on NAIP (USGS)</button>
-          <button id="runNAIPUSDA" type="button" class="secondary">Run on NAIP (USDA)</button>
-        </div>
-      </div>
-
-      <div class="section">
-        <h4>Model Parameters</h4>
-        <div class="row">
-          <div style="flex:1">
-            <label for="conf">Confidence</label>
-            <input id="conf" type="number" step="0.01" min="0" max="1" value="0.25" />
-          </div>
-          <div style="flex:1">
-            <label for="iou">NMS IoU</label>
-            <input id="iou" type="number" step="0.01" min="0" max="1" value="0.5" />
-          </div>
-          <div style="flex:1">
-            <label for="imgsz">Image size</label>
-            <input id="imgsz" type="number" step="1" min="320" max="2048" value="1280" />
-          </div>
-        </div>
-      </div>
-
-      <div class="section">
-        <h4>Results</h4>
-        <div class="row">
-          <span class="pill">Count: <span id="statCount">–</span></span>
-          <span class="pill">Area px: <span id="statAreaPx">–</span></span>
-          <span class="pill">Area m²: <span id="statAreaM2">–</span></span>
-        </div>
-        <div class="note">Rendered with polygons (green) and boxes (orange). If none are detected, try a smaller bbox or a higher-resolution source.</div>
-      </div>
+  <div class="controls">
+    <div class="row">
+      <label>Basemap:
+        <select id="basemap">
+          <option value="esri">ESRI World Imagery</option>
+          <option value="osm">OpenStreetMap</option>
+        </select>
+      </label>
+      <label>Source:
+        <select id="use_usgs">
+          <option value="true" selected>USGS</option>
+          <option value="false">USDA</option>
+        </select>
+      </label>
+      <label>Export width_px:
+        <input id="width_px" type="number" value="2048" min="512" max="3500" />
+      </label>
+      <label>imgsz:
+        <input id="imgsz" type="number" value="1536" min="640" max="2048" step="32" />
+      </label>
+      <label>conf:
+        <input id="conf" type="number" value="0.15" min="0" max="1" step="0.01" />
+      </label>
+      <label>iou (NMS):
+        <input id="iou" type="number" value="0.45" min="0" max="1" step="0.05" />
+      </label>
+      <label><input id="augment" type="checkbox" /> augment (TTA)</label>
+      <label><input id="sharpen" type="checkbox" /> sharpen</label>
+      <button id="preset_high_recall" type="button">High Recall</button>
+      <button id="run_btn" disabled>Run detection</button>
     </div>
-
-    <div>
-      <div id="map"></div>
-      <div id="results">
-        <img id="resultImage" alt="Result" />
-      </div>
+    <div class="hint">
+      Hint: Draw neighborhoods, not whole cities. Valid area is limited to ~0.5–100 km² to preserve detail. <span class="badge">tiling enabled</span>
     </div>
   </div>
 
-  <script>
-    // --- Map setup
-    const map = L.map('map', {
-      center: [39.5, -98.35],
-      zoom: 4,
-      preferCanvas: true
-    });
+  <div id="status" class="hint"></div>
 
-    // Basemap (OSM for context)
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 20,
-      attribution: '&copy; OpenStreetMap'
-    }).addTo(map);
+  <div id="result_panel">
+    <img id="result_img" alt="Result image" />
+    <div id="result_map"></div>
+  </div>
+</div>
 
-    const drawnItems = new L.FeatureGroup();
-    map.addLayer(drawnItems);
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+<script>
+  // Map setup: start over U.S. with ESRI World Imagery
+  const usaCenter = [39.5, -98.35];
+  const map = L.map('map', { zoomControl: true }).setView(usaCenter, 4);
+  const esri = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    attribution: 'Tiles © Esri & contributors'
+  }).addTo(map);
+  const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap' });
+  document.getElementById('basemap').addEventListener('change', (e) => {
+    const val = e.target.value;
+    if (val === 'esri') { map.addLayer(esri); map.removeLayer(osm); }
+    else { map.addLayer(osm); map.removeLayer(esri); }
+  });
 
-    const drawControl = new L.Control.Draw({
-      draw: {
-        polyline: false,
-        marker: false,
-        circle: false,
-        circlemarker: false,
-        polygon: false,
-        rectangle: { shapeOptions: { color: '#2563eb', weight: 2 } }
-      },
-      edit: { featureGroup: drawnItems }
-    });
-    map.addControl(drawControl);
+  // Draw tools
+  const drawnItems = new L.FeatureGroup();
+  map.addLayer(drawnItems);
+  const drawControl = new L.Control.Draw({
+    draw: {
+      polygon: false, polyline: false, circle: false, marker: false, circlemarker: false,
+      rectangle: { showArea: true, shapeOptions: { color: '#f97316', weight: 2 } }
+    },
+    edit: { featureGroup: drawnItems, edit: true, remove: true }
+  });
+  map.addControl(drawControl);
 
-    let currentRect = null;
-    function updateBboxInfo() {
-      const el = document.getElementById('bboxInfo');
-      if (!currentRect) { el.textContent = 'No bbox selected.'; return; }
-      const b = currentRect.getBounds();
-      el.textContent = `BBox (WGS84): minLon=${b.getWest().toFixed(6)}, minLat=${b.getSouth().toFixed(6)}, maxLon=${b.getEast().toFixed(6)}, maxLat=${b.getNorth().toFixed(6)}`;
-    }
+  // Area constraints: 0.5–100 km²
+  function bboxAreaKm2(bounds) {
+    const toRad = (d) => d * Math.PI / 180;
+    const lat1 = bounds.getSouth(), lat2 = bounds.getNorth();
+    const lon1 = bounds.getWest(), lon2 = bounds.getEast();
+    const latMid = toRad((lat1 + lat2) / 2);
+    const mPerDegLat = 111132.92 - 559.82 * Math.cos(2 * latMid) + 1.175 * Math.cos(4 * latMid) - 0.0023 * Math.cos(6 * latMid);
+    const mPerDegLon = 111412.84 * Math.cos(latMid) - 93.5 * Math.cos(3 * latMid) + 0.118 * Math.cos(5 * latMid);
+    const widthM = Math.abs(lon2 - lon1) * mPerDegLon;
+    const heightM = Math.abs(lat2 - lat1) * mPerDegLat;
+    return (widthM * heightM) / 1e6;
+  }
+  function validateRect(layer) {
+    const area = bboxAreaKm2(layer.getBounds());
+    const ok = area >= 0.5 && area <= 100;
+    if (!ok) alert(`Selected area is ${area.toFixed(2)} km². Please draw between 0.5 and 100 km².`);
+    return ok;
+  }
 
-    map.on(L.Draw.Event.CREATED, (e) => {
-      if (currentRect) drawnItems.removeLayer(currentRect);
-      currentRect = e.layer;
-      drawnItems.addLayer(currentRect);
-      updateBboxInfo();
-    });
-    map.on(L.Draw.Event.EDITED, updateBboxInfo);
-    map.on(L.Draw.Event.DELETED, () => { currentRect = null; updateBboxInfo(); });
+  let lastRect = null;
+  map.on(L.Draw.Event.CREATED, function (e) {
+    if (!validateRect(e.layer)) return;
+    drawnItems.clearLayers();
+    lastRect = e.layer;
+    drawnItems.addLayer(lastRect);
+    document.getElementById('run_btn').disabled = false;
+  });
+  map.on(L.Draw.Event.EDITED, function () {
+    const layers = drawnItems.getLayers();
+    if (layers.length && validateRect(layers[0])) lastRect = layers[0];
+  });
+  map.on(L.Draw.Event.DELETED, function () {
+    lastRect = null;
+    document.getElementById('run_btn').disabled = true;
+  });
 
-    document.getElementById('fitUSA').onclick = () => {
-      map.setView([39.5, -98.35], 4);
-    };
-    document.getElementById('clearBbox').onclick = () => {
-      if (currentRect) { drawnItems.removeLayer(currentRect); currentRect = null; }
-      updateBboxInfo();
-    };
+  async function postInferNAIP(bounds, params) {
+    const fd = new FormData();
+    fd.append('min_lon', bounds.getWest());
+    fd.append('min_lat', bounds.getSouth());
+    fd.append('max_lon', bounds.getEast());
+    fd.append('max_lat', bounds.getNorth());
+    fd.append('width_px', params.width_px);
+    fd.append('use_usgs', params.use_usgs);
+    fd.append('conf', params.conf);
+    fd.append('iou', params.iou);
+    fd.append('imgsz', params.imgsz);
+    fd.append('augment', params.augment);
+    fd.append('sharpen', params.sharpen);
+    const res = await fetch('/infer_naip', { method: 'POST', body: fd });
+    if (!res.ok) throw new Error(await res.text());
+    return res.json();
+  }
 
-    // --- Preview layers
-    let previewLayer = null;
-    function clearPreview() {
-      if (previewLayer) { map.removeLayer(previewLayer); previewLayer = null; }
-    }
+  function showResultOnMap(data, bounds) {
+    const resultMapEl = document.getElementById('result_map');
+    resultMapEl.style.display = 'block';
+    const resultMap = L.map('result_map');
+    const imageBounds = L.latLngBounds([bounds.getSouth(), bounds.getWest()], [bounds.getNorth(), bounds.getEast()]);
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      attribution: 'Tiles © Esri & contributors'
+    }).addTo(resultMap);
+    L.imageOverlay(data.image_data_url, imageBounds, { opacity: 1.0 }).addTo(resultMap);
+    resultMap.fitBounds(imageBounds);
+  }
 
-    function getDrawnBbox() {
-      if (!currentRect) return null;
-      const b = currentRect.getBounds();
-      return { minx: b.getWest(), miny: b.getSouth(), maxx: b.getEast(), maxy: b.getNorth() };
-    }
+  document.getElementById('preset_high_recall').addEventListener('click', () => {
+    document.getElementById('imgsz').value = 1536;
+    document.getElementById('conf').value = 0.15;
+    document.getElementById('iou').value = 0.45;
+    document.getElementById('width_px').value = Math.min(3000, Math.max(2048, Number(document.getElementById('width_px').value) || 2048));
+    document.getElementById('augment').checked = true;
+    document.getElementById('sharpen').checked = true;
+  });
 
-    // Example buttons (prefill service URL)
-    const serviceUrl = document.getElementById('serviceUrl');
-    const wmsLayer = document.getElementById('wmsLayer');
-    const sourceNote = document.getElementById('sourceNote');
-    const targetMpp = document.getElementById('targetMpp');
+  document.getElementById('run_btn').addEventListener('click', async () => {
+    const status = document.getElementById('status');
+    const imgEl = document.getElementById('result_img');
+    const resultMapEl = document.getElementById('result_map');
+    if (!lastRect) return;
 
-    document.getElementById('btnMD').onclick = () => {
-      serviceUrl.value = 'https://mdgeodata.md.gov/imagery/rest/services/SixInch/SixInchImagery/ImageServer';
-      wmsLayer.value = '';
-      sourceNote.style.display = 'block';
-      sourceNote.textContent = 'Maryland Six-Inch ImageServer. If the server rejects pixelSize, leave Target m/px blank or reduce the bbox size.';
-    };
-    document.getElementById('btnNY').onclick = () => {
-      serviceUrl.value = 'https://orthos.its.ny.gov/arcgis/services/wms/Latest/MapServer/WMSServer?request=GetCapabilities&service=WMS';
-      wmsLayer.value = '';
-      sourceNote.style.display = 'block';
-      sourceNote.textContent = 'NY Latest WMS. Provide a LAYERS name if auto-pick fails. Target m/px is ignored by WMS; server controls scale via width/height.';
-    };
-    document.getElementById('btnVA').onclick = () => {
-      serviceUrl.value = 'https://vginmaps.vdem.virginia.gov/arcgis/rest/services/VBMP_Imagery/VBMP2024_Infrared_WGS/MapServer';
-      wmsLayer.value = '';
-      sourceNote.style.display = 'block';
-      sourceNote.textContent = 'Virginia VBMP Infrared MapServer. False-color imagery may reduce model accuracy. If export is disallowed, try smaller bbox or leave Target m/px blank.';
-    };
-
-    function updateSourceNoteByUrl() {
-      const url = (serviceUrl.value || '').trim().toLowerCase();
-      if (!url) { sourceNote.style.display = 'none'; return; }
-      sourceNote.style.display = 'block';
-      if (url.includes('imageserver')) {
-        sourceNote.textContent = 'Esri ImageServer detected. We will request exportImage. Some servers restrict pixelSize or image size; if you see errors, try a larger Target m/px (coarser), a smaller bbox, or leave Target m/px blank.';
-      } else if (url.includes('mapserver') && !url.includes('wms')) {
-        sourceNote.textContent = 'Esri MapServer detected. We will request export. PixelSize may or may not be honored. If rejected, try smaller bbox or leave Target m/px blank.';
-      } else if (url.includes('wms')) {
-        sourceNote.textContent = 'WMS detected. Provide LAYERS if auto-pick fails. Target m/px is not used; server scale is set by width/height of the request.';
-      } else {
-        sourceNote.textContent = 'Unrecognized pattern. Must include ImageServer, MapServer, or WMSServer.';
-      }
-    }
-    serviceUrl.addEventListener('input', updateSourceNoteByUrl);
-
-    // Preview: add chosen layer to map
-    document.getElementById('previewBtn').onclick = () => {
-      clearPreview();
-      const url = (serviceUrl.value || '').trim();
-      if (!url) { alert('Enter a service URL first.'); return; }
-      const low = url.toLowerCase();
-      try {
-        if (low.includes('imageserver')) {
-          if (!L.esri) { alert('Esri Leaflet not loaded.'); return; }
-          previewLayer = L.esri.dynamicMapLayer({ url, opacity: 0.75 });
-          previewLayer.addTo(map);
-        } else if (low.includes('mapserver') && !low.includes('wms')) {
-          if (!L.esri) { alert('Esri Leaflet not loaded.'); return; }
-          previewLayer = L.esri.dynamicMapLayer({ url, opacity: 0.75 });
-          previewLayer.addTo(map);
-        } else if (low.includes('wms')) {
-          const base = url.split('?')[0];
-          const layerName = (wmsLayer.value || '').trim() || undefined;
-          const wmsOpts = { layers: layerName || '', format: 'image/png', transparent: false, version: '1.3.0' };
-          previewLayer = L.tileLayer.wms(base, wmsOpts);
-          previewLayer.addTo(map);
-        } else {
-          alert('Unrecognized URL. Must include ImageServer, MapServer, or WMS.');
-        }
-      } catch (e) {
-        console.error(e);
-        alert('Failed to preview layer. See console for details.');
-      }
+    const bounds = lastRect.getBounds();
+    const params = {
+      use_usgs: document.getElementById('use_usgs').value === 'true',
+      width_px: Number(document.getElementById('width_px').value),
+      imgsz: Number(document.getElementById('imgsz').value),
+      conf: Number(document.getElementById('conf').value),
+      iou: Number(document.getElementById('iou').value),
+      augment: document.getElementById('augment').checked,
+      sharpen: document.getElementById('sharpen').checked,
     };
 
-    function getModelParams() {
-      return {
-        conf: parseFloat(document.getElementById('conf').value || '0.25'),
-        iou: parseFloat(document.getElementById('iou').value || '0.5'),
-        imgsz: parseInt(document.getElementById('imgsz').value || '1280', 10)
-      };
+    status.textContent = 'Fetching NAIP and running detection...';
+    imgEl.style.display = 'none';
+    resultMapEl.style.display = 'none';
+    resultMapEl.innerHTML = '';
+
+    try {
+      const data = await postInferNAIP(bounds, params);
+      if (data.error) throw new Error(data.error);
+      imgEl.src = data.image_data_url; // still show static result
+      imgEl.style.display = 'block';
+      showResultOnMap(data, bounds);
+      status.textContent = `Detections: ${data.count} | Total area (px): ${Math.round(data.total_area_pixels)} | mpp_x: ${data.mpp_x?.toFixed?.(3)} m | mpp_y: ${data.mpp_y?.toFixed?.(3)} m | augment: ${data.used_augment} | sharpen: ${data.used_sharpen}`;
+    } catch (err) {
+      console.error(err);
+      status.textContent = 'Error: ' + (err.message || err);
     }
-
-    function showResults(data) {
-      if (data.error) {
-        alert(data.error);
-        // If export disallowed, show actionable hint
-        const msg = (data.error || '').toLowerCase();
-        if (msg.includes('exportimage') || msg.includes('export') || msg.includes('wms getmap')) {
-          sourceNote.style.display = 'block';
-          sourceNote.textContent = 'The server rejected the request. Try: a smaller bbox, a coarser Target m/px (e.g., 0.5), or leave Target m/px blank to let the server choose.';
-        }
-        return;
-      }
-      document.getElementById('resultImage').src = data.image_data_url || '';
-      document.getElementById('statCount').textContent = data.count ?? '0';
-      document.getElementById('statAreaPx').textContent = (data.total_area_pixels ?? 0).toFixed(1);
-      document.getElementById('statAreaM2').textContent = data.total_area_m2 ? data.total_area_m2.toFixed(2) : '–';
-    }
-
-    async function runGeneric() {
-      const bbox = getDrawnBbox();
-      if (!bbox) { alert('Draw a bbox first.'); return; }
-      const url = (serviceUrl.value || '').trim();
-      if (!url) { alert('Enter a service URL.'); return; }
-      const layer = (wmsLayer.value || '').trim();
-      const { conf, iou, imgsz } = getModelParams();
-      const fd = new FormData();
-      fd.append('service_url', url);
-      fd.append('min_lon', bbox.minx);
-      fd.append('min_lat', bbox.miny);
-      fd.append('max_lon', bbox.maxx);
-      fd.append('max_lat', bbox.maxy);
-      if (layer) fd.append('wms_layer', layer);
-      const t = (targetMpp.value || '').trim();
-      if (t) fd.append('target_mpp', t);
-      fd.append('conf', conf);
-      fd.append('iou', iou);
-      fd.append('imgsz', imgsz);
-      const r = await fetch('/infer_generic_imagery', { method: 'POST', body: fd });
-      const data = await r.json();
-      showResults(data);
-    }
-
-    document.getElementById('runGeneric').onclick = () => { runGeneric(); };
-
-    async function runNAIP(useUSGS) {
-      const bbox = getDrawnBbox();
-      if (!bbox) { alert('Draw a bbox first.'); return; }
-      const { conf, iou, imgsz } = getModelParams();
-      const fd = new FormData();
-      fd.append('min_lon', bbox.minx);
-      fd.append('min_lat', bbox.miny);
-      fd.append('max_lon', bbox.maxx);
-      fd.append('max_lat', bbox.maxy);
-      fd.append('conf', conf);
-      fd.append('iou', iou);
-      fd.append('imgsz', imgsz);
-      fd.append('use_usgs', useUSGS ? 'true' : 'false');
-      const r = await fetch('/infer_naip', { method: 'POST', body: fd });
-      const data = await r.json();
-      showResults(data);
-    }
-
-    document.getElementById('runNAIPUSGS').onclick = () => runNAIP(true);
-    document.getElementById('runNAIPUSDA').onclick = () => runNAIP(false);
-  </script>
-</body>
-</html>
+  });
+</script>
