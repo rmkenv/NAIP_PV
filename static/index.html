@@ -1,4 +1,4 @@
-<!-- Map-based NAIP fetch and inference with enhanced UX -->
+<!-- Map-based NAIP fetch and inference with enhanced UX (with augment+sharpen+High Recall) -->
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
 <style>
@@ -43,6 +43,9 @@
       <label>iou (NMS):
         <input id="iou" type="number" value="0.45" min="0" max="1" step="0.05" />
       </label>
+      <label><input id="augment" type="checkbox" /> augment (TTA)</label>
+      <label><input id="sharpen" type="checkbox" /> sharpen</label>
+      <button id="preset_high_recall" type="button">High Recall</button>
       <button id="run_btn" disabled>Run detection</button>
     </div>
     <div class="hint">
@@ -88,7 +91,7 @@
 
   // Area constraints: 0.5–100 km²
   function bboxAreaKm2(bounds) {
-    const R = 6371000, toRad = (d) => d * Math.PI / 180;
+    const toRad = (d) => d * Math.PI / 180;
     const lat1 = bounds.getSouth(), lat2 = bounds.getNorth();
     const lon1 = bounds.getWest(), lon2 = bounds.getEast();
     const latMid = toRad((lat1 + lat2) / 2);
@@ -133,6 +136,8 @@
     fd.append('conf', params.conf);
     fd.append('iou', params.iou);
     fd.append('imgsz', params.imgsz);
+    fd.append('augment', params.augment);
+    fd.append('sharpen', params.sharpen);
     const res = await fetch('/infer_naip', { method: 'POST', body: fd });
     if (!res.ok) throw new Error(await res.text());
     return res.json();
@@ -150,6 +155,15 @@
     resultMap.fitBounds(imageBounds);
   }
 
+  document.getElementById('preset_high_recall').addEventListener('click', () => {
+    document.getElementById('imgsz').value = 1536;
+    document.getElementById('conf').value = 0.15;
+    document.getElementById('iou').value = 0.45;
+    document.getElementById('width_px').value = Math.min(3000, Math.max(2048, Number(document.getElementById('width_px').value) || 2048));
+    document.getElementById('augment').checked = true;
+    document.getElementById('sharpen').checked = true;
+  });
+
   document.getElementById('run_btn').addEventListener('click', async () => {
     const status = document.getElementById('status');
     const imgEl = document.getElementById('result_img');
@@ -163,6 +177,8 @@
       imgsz: Number(document.getElementById('imgsz').value),
       conf: Number(document.getElementById('conf').value),
       iou: Number(document.getElementById('iou').value),
+      augment: document.getElementById('augment').checked,
+      sharpen: document.getElementById('sharpen').checked,
     };
 
     status.textContent = 'Fetching NAIP and running detection...';
@@ -173,10 +189,10 @@
     try {
       const data = await postInferNAIP(bounds, params);
       if (data.error) throw new Error(data.error);
-      imgEl.src = data.image_data_url; // still show the static result if needed
+      imgEl.src = data.image_data_url; // still show static result
       imgEl.style.display = 'block';
       showResultOnMap(data, bounds);
-      status.textContent = `Detections: ${data.count} | Total area (px): ${Math.round(data.total_area_pixels)} | mpp_x: ${data.mpp_x?.toFixed?.(3)} m | mpp_y: ${data.mpp_y?.toFixed?.(3)} m`;
+      status.textContent = `Detections: ${data.count} | Total area (px): ${Math.round(data.total_area_pixels)} | mpp_x: ${data.mpp_x?.toFixed?.(3)} m | mpp_y: ${data.mpp_y?.toFixed?.(3)} m | augment: ${data.used_augment} | sharpen: ${data.used_sharpen}`;
     } catch (err) {
       console.error(err);
       status.textContent = 'Error: ' + (err.message || err);
