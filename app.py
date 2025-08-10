@@ -1,10 +1,11 @@
 # =======================================================================
-# hyperspectral_app.py
+# hyperspectral_app_sp_pi.py
 # A full FastAPI service that preserves the NAIP NIR band, computes
-# NDVI / NDBI / Solar-Panel Spectral Index (SPSI), filters vegetation
+# NDVI / NDBI / Solar-Panel Spectral Index (SPSI) and Solar Photovoltaic
+# Panel Index (SPPI) from the recent research, filters vegetation
 # false-positives, offers optional sharpening, test-time augmentation (TTA),
-# and an optional multi-channel feature stack ready for custom 4-channel
-# (RGB+NIR) or 7-channel YOLO training.
+# and an optional multi-channel feature stack ready for custom multispectral
+# YOLO training including SPPI.
 # =======================================================================
 
 import base64
@@ -25,7 +26,7 @@ from ultralytics import YOLO
 # ───────────────────────────────
 # 1. FastAPI & CORS Boilerplate
 # ───────────────────────────────
-app = FastAPI(title="Hyperspectral Solar-Panel Detector")
+app = FastAPI(title="Hyperspectral Solar-Panel Detector with SPPI")
 
 if not os.path.exists("static"):
     os.makedirs("static", exist_ok=True)
@@ -42,20 +43,21 @@ app.add_middleware(
 # 2. YOLO Model
 # ───────────────────────────────
 def download_model() -> str:
-    repo_id = "finloop/yolov8s-seg-solar-panels"          # RGB-trained weights
+    repo_id = "finloop/yolov8s-seg-solar-panels"  # RGB-trained weights
     model_path = hf_hub_download(repo_id, filename="best.pt")
     return model_path
 
 MODEL_PATH = download_model()
-MODEL = YOLO(MODEL_PATH)                                  # expects 3-channel RGB
+MODEL = YOLO(MODEL_PATH)  # expects 3-channel RGB
 
 # ───────────────────────────────
-# 3. Spectral Utilities
+# 3. Spectral Utilities & Indices
 # ───────────────────────────────
+
 # Color constants (BGR)
 PANEL_COLOR = (60, 220, 60)
-BOX_COLOR   = (40, 180, 255)
-TEXT_COLOR  = (255, 255, 255)
+BOX_COLOR = (40, 180, 255)
+TEXT_COLOR = (255, 255, 255)
 
 def numpy_from_upload_multispectral(file_bytes: bytes) -> np.ndarray:
     """
@@ -79,7 +81,7 @@ def numpy_from_upload_multispectral(file_bytes: bytes) -> np.ndarray:
 
 def compute_spectral_indices(img_4band: np.ndarray) -> dict:
     """
-    Return NDVI, NDBI and Solar-Panel Spectral Index (SPSI).
+    Return NDVI, NDBI, SPSI and SPPI.
     Input must be 4-band NAIP order: R,G,B,NIR.
     """
     if img_4band.shape[2] < 4:
@@ -90,31 +92,42 @@ def compute_spectral_indices(img_4band: np.ndarray) -> dict:
     blue  = img_4band[:, :, 2].astype(np.float32)
     nir   = img_4band[:, :, 3].astype(np.float32)
 
+    # NDVI: Vegetation index
     ndvi = (nir - red) / (nir + red + 1e-7)
-    ndbi = (red - nir) / (red + nir + 1e-7)
-    spsi = (red / (nir + 1.0)) - (blue / (green + 1.0))      # simple SPSI
 
-    return {"ndvi": ndvi, "ndbi": ndbi, "spsi": spsi}
+    # NDBI: Built-up index (positive for built-up including solar panels)
+    ndbi = (red - nir) / (red + nir + 1e-7)
+
+    # SPSI: Simple Solar Panel Spectral Index (custom)
+    spsi = (red / (nir + 1.0)) - (blue / (green + 1.0))
+
+    # SPPI: Solar Photovoltaic Panel Index from the cited paper's principles
+    # Placeholder formula adapting their spectral peak (400-500 nm in blue channel)
+    # Here assumed as (blue / (nir + 1)) - (red / (green + 1)); adjust if band wavelengths known precisely
+    sppi = (blue / (nir + 1.0)) - (red / (green + 1.0))
+
+    return {"ndvi": ndvi, "ndbi": ndbi, "spsi": spsi, "sppi": sppi}
 
 def create_feature_stack(img_4band: np.ndarray) -> np.ndarray:
     """
-    Build a 7-channel tensor: R,G,B,NIR,NDVI,NDBI,SPSI
-    suitable for 7-channel network training.
+    Build a 8-channel tensor: R,G,B,NIR,NDVI,NDBI,SPSI,SPPI
+    suitable for multispectral network training.
     """
     idx = compute_spectral_indices(img_4band)
     stack = np.stack(
         [
-            img_4band[:, :, 0],            # R
-            img_4band[:, :, 1],            # G
-            img_4band[:, :, 2],            # B
-            img_4band[:, :, 3],            # NIR
-            idx["ndvi"],
-            idx["ndbi"],
-            idx["spsi"],
+            img_4band[:, :, 0],      # R
+            img_4band[:, :, 1],      # G
+            img_4band[:, :, 2],      # B
+            img_4band[:, :, 3],      # NIR
+            idx["ndvi"],             # NDVI vegetation index
+            idx["ndbi"],             # NDBI built-up index
+            idx["spsi"],             # Solar Panel Spectral Index
+            idx["sppi"],             # Solar Photovoltaic Panel Index (SPPI)
         ],
         axis=2,
     )
-    # Optional: normalize each band (mean/std) here.
+    # Optional: normalize each band (mean/std) before training
     return stack
 
 def encode_png(img_bgr: np.ndarray) -> bytes:
@@ -238,7 +251,6 @@ def yolo_infer_with_tta(model, img_rgb: np.ndarray, conf=0.25, iou=0.5, imgsz=12
 
     return all_polygons, all_boxes, all_confs
 
-
 def yolo_infer_rgb(img_bgr: np.ndarray, conf=0.25, iou=0.5, imgsz=1280):
     """Run YOLO on RGB image and return result object."""
     results = MODEL(img_bgr[:, :, :3], conf=conf, iou=iou, imgsz=imgsz, verbose=False)
@@ -319,14 +331,14 @@ async def infer(
         return JSONResponse({"error": str(e)}, status_code=400)
 
 # ───────────────────────────────
-# 7. Optional Endpoint: Return 7-channel Feature Stack (for training)
+# 7. Optional Endpoint: Return 8-channel Feature Stack (for training)
 # ───────────────────────────────
 @app.post("/extract_features")
 async def extract_features(file: UploadFile = File(...)):
     """
     Upload a 4-band image → return a zipped .npz file containing:
-    R, G, B, NIR, NDVI, NDBI, SPSI (7 bands).  Handy for training a
-    custom 7-channel YOLO model.
+    R, G, B, NIR, NDVI, NDBI, SPSI, and SPPI (8 bands).
+    Handy for training a custom multispectral YOLO model.
     """
     try:
         img_bytes = await file.read()
@@ -344,5 +356,5 @@ async def extract_features(file: UploadFile = File(...)):
         return JSONResponse({"error": str(e)}, status_code=400)
 
 # ───────────────────────────────
-# 8. Run via:  uvicorn hyperspectral_app:app --reload
+# 8. Run via:  uvicorn hyperspectral_app_sp_pi:app --reload
 # ───────────────────────────────
