@@ -1,53 +1,80 @@
-<!-- Map-based NAIP fetch and inference -->
+<!-- Map-based NAIP fetch and inference with enhanced UX -->
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
 <style>
-  #map { height: 420px; margin: 10px 0; }
-  .controls { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+  #map { height: 520px; margin: 10px 0; }
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; margin: 8px 0; align-items: center; }
   .controls label { font-size: 14px; }
+  .hint { color:#444; font-size: 13px; margin-top: 4px; }
+  .row { display:flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  #result_panel { display: grid; grid-template-columns: 360px 1fr; gap: 10px; align-items: start; }
+  #result_img { width: 100%; display:none; border: 1px solid #ddd; border-radius: 6px; }
+  #result_map { height: 520px; display:none; border: 1px solid #ddd; border-radius: 6px; }
+  .badge { display:inline-block; padding:2px 6px; border-radius:10px; background:#eef; color:#334; font-size:12px; margin-left:6px; }
 </style>
 
 <div>
-  <h3>Map: Draw a box to fetch NAIP and detect</h3>
+  <h3>Draw a box anywhere in the U.S. to fetch NAIP and detect panels</h3>
   <div id="map"></div>
 
   <div class="controls">
-    <label>Source:
-      <select id="use_usgs">
-        <option value="true" selected>USGS</option>
-        <option value="false">USDA</option>
-      </select>
-    </label>
-    <label>Export width_px:
-      <input id="width_px" type="number" value="2048" min="512" max="3500" />
-    </label>
-    <label>imgsz:
-      <input id="imgsz" type="number" value="1280" min="640" max="2048" step="32" />
-    </label>
-    <label>conf:
-      <input id="conf" type="number" value="0.2" min="0" max="1" step="0.01" />
-    </label>
-    <label>iou (NMS):
-      <input id="iou" type="number" value="0.4" min="0" max="1" step="0.05" />
-    </label>
-    <button id="run_btn" disabled>Run detection on drawn box</button>
+    <div class="row">
+      <label>Basemap:
+        <select id="basemap">
+          <option value="esri">ESRI World Imagery</option>
+          <option value="osm">OpenStreetMap</option>
+        </select>
+      </label>
+      <label>Source:
+        <select id="use_usgs">
+          <option value="true" selected>USGS</option>
+          <option value="false">USDA</option>
+        </select>
+      </label>
+      <label>Export width_px:
+        <input id="width_px" type="number" value="2048" min="512" max="3500" />
+      </label>
+      <label>imgsz:
+        <input id="imgsz" type="number" value="1536" min="640" max="2048" step="32" />
+      </label>
+      <label>conf:
+        <input id="conf" type="number" value="0.15" min="0" max="1" step="0.01" />
+      </label>
+      <label>iou (NMS):
+        <input id="iou" type="number" value="0.45" min="0" max="1" step="0.05" />
+      </label>
+      <button id="run_btn" disabled>Run detection</button>
+    </div>
+    <div class="hint">
+      Hint: Draw neighborhoods, not whole cities. Valid area is limited to ~0.5–100 km² to preserve detail. <span class="badge">tiling enabled</span>
+    </div>
   </div>
 
-  <div id="status" style="margin:6px 0; color:#555;"></div>
-  <img id="result_img" alt="Result" style="max-width:100%; display:none;" />
+  <div id="status" class="hint"></div>
+
+  <div id="result_panel">
+    <img id="result_img" alt="Result image" />
+    <div id="result_map"></div>
+  </div>
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
 <script>
-  // Initialize map
-  const map = L.map('map').setView([29.76, -95.37], 10); // Houston area default
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19,
-    attribution: '© OpenStreetMap'
+  // Map setup: start over U.S. with ESRI World Imagery
+  const usaCenter = [39.5, -98.35];
+  const map = L.map('map', { zoomControl: true }).setView(usaCenter, 4);
+  const esri = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    attribution: 'Tiles © Esri & contributors'
   }).addTo(map);
+  const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap' });
+  document.getElementById('basemap').addEventListener('change', (e) => {
+    const val = e.target.value;
+    if (val === 'esri') { map.addLayer(esri); map.removeLayer(osm); }
+    else { map.addLayer(osm); map.removeLayer(esri); }
+  });
 
-  // Draw controls (rectangle only)
+  // Draw tools
   const drawnItems = new L.FeatureGroup();
   map.addLayer(drawnItems);
   const drawControl = new L.Control.Draw({
@@ -59,20 +86,37 @@
   });
   map.addControl(drawControl);
 
+  // Area constraints: 0.5–100 km²
+  function bboxAreaKm2(bounds) {
+    const R = 6371000, toRad = (d) => d * Math.PI / 180;
+    const lat1 = bounds.getSouth(), lat2 = bounds.getNorth();
+    const lon1 = bounds.getWest(), lon2 = bounds.getEast();
+    const latMid = toRad((lat1 + lat2) / 2);
+    const mPerDegLat = 111132.92 - 559.82 * Math.cos(2 * latMid) + 1.175 * Math.cos(4 * latMid) - 0.0023 * Math.cos(6 * latMid);
+    const mPerDegLon = 111412.84 * Math.cos(latMid) - 93.5 * Math.cos(3 * latMid) + 0.118 * Math.cos(5 * latMid);
+    const widthM = Math.abs(lon2 - lon1) * mPerDegLon;
+    const heightM = Math.abs(lat2 - lat1) * mPerDegLat;
+    return (widthM * heightM) / 1e6;
+  }
+  function validateRect(layer) {
+    const area = bboxAreaKm2(layer.getBounds());
+    const ok = area >= 0.5 && area <= 100;
+    if (!ok) alert(`Selected area is ${area.toFixed(2)} km². Please draw between 0.5 and 100 km².`);
+    return ok;
+  }
+
   let lastRect = null;
   map.on(L.Draw.Event.CREATED, function (e) {
+    if (!validateRect(e.layer)) return;
     drawnItems.clearLayers();
     lastRect = e.layer;
     drawnItems.addLayer(lastRect);
     document.getElementById('run_btn').disabled = false;
   });
-
   map.on(L.Draw.Event.EDITED, function () {
-    // Keep using the single edited rectangle
     const layers = drawnItems.getLayers();
-    lastRect = layers.length ? layers[0] : null;
+    if (layers.length && validateRect(layers[0])) lastRect = layers[0];
   });
-
   map.on(L.Draw.Event.DELETED, function () {
     lastRect = null;
     document.getElementById('run_btn').disabled = true;
@@ -80,7 +124,6 @@
 
   async function postInferNAIP(bounds, params) {
     const fd = new FormData();
-    // Bounds are WGS84 from Leaflet
     fd.append('min_lon', bounds.getWest());
     fd.append('min_lat', bounds.getSouth());
     fd.append('max_lon', bounds.getEast());
@@ -91,16 +134,26 @@
     fd.append('iou', params.iou);
     fd.append('imgsz', params.imgsz);
     const res = await fetch('/infer_naip', { method: 'POST', body: fd });
-    if (!res.ok) {
-      const txt = await res.text();
-      throw new Error(txt || ('HTTP ' + res.status));
-    }
+    if (!res.ok) throw new Error(await res.text());
     return res.json();
+  }
+
+  function showResultOnMap(data, bounds) {
+    const resultMapEl = document.getElementById('result_map');
+    resultMapEl.style.display = 'block';
+    const resultMap = L.map('result_map');
+    const imageBounds = L.latLngBounds([bounds.getSouth(), bounds.getWest()], [bounds.getNorth(), bounds.getEast()]);
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      attribution: 'Tiles © Esri & contributors'
+    }).addTo(resultMap);
+    L.imageOverlay(data.image_data_url, imageBounds, { opacity: 1.0 }).addTo(resultMap);
+    resultMap.fitBounds(imageBounds);
   }
 
   document.getElementById('run_btn').addEventListener('click', async () => {
     const status = document.getElementById('status');
     const imgEl = document.getElementById('result_img');
+    const resultMapEl = document.getElementById('result_map');
     if (!lastRect) return;
 
     const bounds = lastRect.getBounds();
@@ -114,12 +167,15 @@
 
     status.textContent = 'Fetching NAIP and running detection...';
     imgEl.style.display = 'none';
+    resultMapEl.style.display = 'none';
+    resultMapEl.innerHTML = '';
 
     try {
       const data = await postInferNAIP(bounds, params);
       if (data.error) throw new Error(data.error);
-      imgEl.src = data.image_data_url;
+      imgEl.src = data.image_data_url; // still show the static result if needed
       imgEl.style.display = 'block';
+      showResultOnMap(data, bounds);
       status.textContent = `Detections: ${data.count} | Total area (px): ${Math.round(data.total_area_pixels)} | mpp_x: ${data.mpp_x?.toFixed?.(3)} m | mpp_y: ${data.mpp_y?.toFixed?.(3)} m`;
     } catch (err) {
       console.error(err);
