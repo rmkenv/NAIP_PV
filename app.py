@@ -1,5 +1,6 @@
 # app.py
 import base64
+import io
 import os
 from typing import Optional, List, Tuple
 
@@ -9,16 +10,31 @@ import requests
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import hf_hub_download
 from ultralytics import YOLO
 
-app = FastAPI(title="Solar Panel Detector (NAIP)")
+# --------------------------------------
+# App setup
+# --------------------------------------
+app = FastAPI(title="Solar Panel Detector (Imagery-Agnostic)")
 
-# Serve static files (index.html)
+# Static
 if not os.path.exists("static"):
     os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# CORS for local dev and external UIs
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --------------------------------------
+# Model
+# --------------------------------------
 
 def download_model() -> str:
     # YOLOv8 segmentation weights for solar panels (MIT):
@@ -28,7 +44,6 @@ def download_model() -> str:
     model_path = hf_hub_download(repo_id=repo_id, filename=filename)
     return model_path
 
-
 MODEL_PATH = download_model()
 MODEL = YOLO(MODEL_PATH)
 
@@ -36,25 +51,21 @@ PANEL_COLOR = (60, 220, 60)   # BGR green
 BOX_COLOR = (40, 180, 255)    # BGR orange
 TEXT_COLOR = (255, 255, 255)
 
-
-# --------------------- Image utils ---------------------
-
-def to_3ch_bgr(img: np.ndarray) -> np.ndarray:
-    if img is None:
-        raise ValueError("Empty image")
-    if img.ndim == 2:
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    if img.ndim == 3 and img.shape[2] > 3:
-        img = img[:, :, :3]
-    return img
-
+# --------------------------------------
+# Utilities
+# --------------------------------------
 
 def numpy_from_upload(file_bytes: bytes) -> np.ndarray:
     arr = np.frombuffer(file_bytes, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise ValueError("Could not decode image. Please upload a valid PNG/JPG.")
-    return to_3ch_bgr(img)
+    # Some PNGs may have 4 channels (RGB + alpha/NIR). Drop to 3-channel RGB-like.
+    if img.ndim == 3 and img.shape[2] > 3:
+        img = img[:, :, :3]
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    return img
 
 
 def encode_png(img_bgr: np.ndarray) -> bytes:
@@ -64,25 +75,12 @@ def encode_png(img_bgr: np.ndarray) -> bytes:
     return buf.tobytes()
 
 
-def unsharp_mask(img: np.ndarray, radius: int = 3, amount: float = 1.0, threshold: int = 0) -> np.ndarray:
-    """Simple unsharp mask: enhance small edges; conservative defaults."""
-    if radius <= 0 or amount <= 0:
-        return img
-    blurred = cv2.GaussianBlur(img, (0, 0), sigmaX=radius, sigmaY=radius)
-    sharp = cv2.addWeighted(img, 1 + amount, blurred, -amount, 0)
-    if threshold > 0:
-        low, high = cv2.threshold(cv2.cvtColor(cv2.absdiff(img, blurred), cv2.COLOR_BGR2GRAY), threshold, 255, cv2.THRESH_BINARY)
-        mask = cv2.cvtColor(high, cv2.COLOR_GRAY2BGR)
-        return np.where(mask > 0, sharp, img)
-    return np.clip(sharp, 0, 255).astype(np.uint8)
-
-
 def draw_detections(
     img_bgr: np.ndarray,
     polygons: List[np.ndarray],
     boxes: Optional[np.ndarray],
     confs: Optional[np.ndarray],
-    alpha: float = 0.35
+    alpha: float = 0.35,
 ) -> np.ndarray:
     overlay = np.zeros_like(img_bgr)
     for poly in polygons:
@@ -115,15 +113,16 @@ def polygon_areas_in_pixels(polygons: List[np.ndarray]) -> List[float]:
         areas.append(float(cv2.contourArea(p)))
     return areas
 
-
 # --- Web Mercator helpers (EPSG:3857) ---
 R_MAJOR = 6378137.0
 
 def lonlat_to_webmerc(lon: float, lat: float) -> Tuple[float, float]:
     x = R_MAJOR * np.deg2rad(lon)
+    # clamp latitude to Web Mercator valid range
     lat = max(min(lat, 85.05112878), -85.05112878)
     y = R_MAJOR * np.log(np.tan(np.pi / 4.0 + np.deg2rad(lat) / 2.0))
     return float(x), float(y)
+
 
 def bbox4326_to_3857(min_lon: float, min_lat: float, max_lon: float, max_lat: float) -> Tuple[float, float, float, float]:
     x1, y1 = lonlat_to_webmerc(min_lon, min_lat)
@@ -133,23 +132,34 @@ def bbox4326_to_3857(min_lon: float, min_lat: float, max_lon: float, max_lat: fl
     return xmin, ymin, xmax, ymax
 
 
-# --- NAIP fetch via ArcGIS ImageServer Export Image ---
+def webmerc_to_lonlat(x: float, y: float) -> Tuple[float, float]:
+    lon = np.rad2deg(x / R_MAJOR)
+    lat = np.rad2deg(2 * np.arctan(np.exp(y / R_MAJOR)) - np.pi / 2)
+    return float(lon), float(lat)
+
+# --------------------------------------
+# NAIP via ArcGIS ImageServer (existing flow)
+# --------------------------------------
 USGS_NAIP_EXPORT = "https://imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPImagery/ImageServer/exportImage"
 USDA_NAIP_EXPORT = "https://gis.apfo.usda.gov/arcgis/rest/services/NAIP/USDA_CONUS_PRIME/ImageServer/exportImage"
 
 def fetch_naip_bbox_mercator(
     xmin: float, ymin: float, xmax: float, ymax: float,
-    width_px: int = 2048,
+    width_px: int = 1536,
     use_usgs: bool = True
 ) -> Tuple[np.ndarray, float, float]:
-    width_px = int(max(512, min(3500, width_px)))
+    """
+    Fetch a NAIP image for a given EPSG:3857 bbox at a requested pixel width.
+    Returns (image_bgr, mpp_x, mpp_y) where mpp is meters per pixel.
+    """
+    width_px = int(max(256, min(3000, width_px)))
     w_m = xmax - xmin
     h_m = ymax - ymin
     if w_m <= 0 or h_m <= 0:
         raise ValueError("Invalid bbox.")
     aspect = h_m / w_m
     height_px = int(round(width_px * aspect))
-    height_px = max(512, min(3500, height_px))
+    height_px = max(256, min(3000, height_px))
 
     params = {
         "f": "image",
@@ -160,7 +170,7 @@ def fetch_naip_bbox_mercator(
         "format": "png",
     }
     url = USGS_NAIP_EXPORT if use_usgs else USDA_NAIP_EXPORT
-    resp = requests.get(url, params=params, timeout=45)
+    resp = requests.get(url, params=params, timeout=30)
     if resp.status_code != 200 or not resp.content:
         raise RuntimeError(f"ExportImage failed: HTTP {resp.status_code}")
     content_type = resp.headers.get("Content-Type", "")
@@ -172,114 +182,250 @@ def fetch_naip_bbox_mercator(
     img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise RuntimeError("Failed to decode image from ImageServer.")
-    img = to_3ch_bgr(img)
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.ndim == 3 and img.shape[2] > 3:
+        img = img[:, :, :3]
 
     mpp_x = w_m / float(img.shape[1])
     mpp_y = h_m / float(img.shape[0])
     return img, mpp_x, mpp_y
 
+# --------------------------------------
+# Generic imagery ingestion (ImageServer / MapServer / WMS)
+# --------------------------------------
 
-# ---------- YOLO inference helpers (tiling + options) ----------
-
-def run_yolo_single(img_bgr: np.ndarray, conf: float, iou: float, imgsz: int, augment: bool, max_det: int = 5000):
-    return MODEL(img_bgr, conf=conf, iou=iou, imgsz=imgsz, augment=augment, max_det=max_det, verbose=False)[0]
-
-
-def iou_with(box: np.ndarray, boxes: np.ndarray) -> np.ndarray:
-    x1 = np.maximum(box[0], boxes[:, 0])
-    y1 = np.maximum(box[1], boxes[:, 1])
-    x2 = np.minimum(box[2], boxes[:, 2])
-    y2 = np.minimum(box[3], boxes[:, 3])
-    inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
-    area1 = (box[2] - box[0]) * (box[3] - box[1])
-    area2 = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-    union = area1 + area2 - inter + 1e-6
-    return inter / union
-
-
-def nms_numpy(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float = 0.5) -> np.ndarray:
-    if boxes.size == 0:
-        return np.empty((0,), dtype=int)
-    idxs = scores.argsort()[::-1]
-    keep = []
-    while idxs.size:
-        i = idxs[0]
-        keep.append(i)
-        if idxs.size == 1:
-            break
-        rest = idxs[1:]
-        ious = iou_with(boxes[i], boxes[rest])
-        idxs = rest[ious < iou_thresh]
-    return np.array(keep, dtype=int)
+def sanitize_service_url(url: str) -> str:
+    u = url.strip()
+    # Remove query strings for base endpoints
+    if "?" in u:
+        u = u.split("?", 1)[0]
+    # Common trailing paths
+    lowers = u.lower()
+    if "imageserver" in lowers:
+        return u[:lowers.rfind("imageserver")] + u[lowers.rfind("imageserver"):]
+    if "mapserver" in lowers:
+        return u[:lowers.rfind("mapserver")] + u[lowers.rfind("mapserver"):]
+    if "wmss" in lowers:
+        return u[:lowers.find("wmss")] + "WMSServer"
+    if u.lower().endswith("wmssrver"):
+        return u[:-1] + "er"  # fix typo case
+    if "wmsserver" in lowers:
+        return u[:lowers.rfind("wmsserver")] + u[lowers.rfind("wmsserver"):]
+    return u
 
 
-def tile_inference_yolo(
-    model,
-    img_bgr: np.ndarray,
-    tile: int = 1024,
-    overlap: int = 256,
-    imgsz: int = 1280,
-    conf: float = 0.2,
-    iou: float = 0.4,
-    augment: bool = False,
-    max_det: int = 5000,
-):
-    H, W = img_bgr.shape[:2]
-    stride = max(1, tile - overlap)
-    all_boxes, all_scores, all_classes, all_polys = [], [], [], []
-
-    for y in range(0, max(H - tile, 0) + 1, stride):
-        for x in range(0, max(W - tile, 0) + 1, stride):
-            crop = img_bgr[y:y + tile, x:x + tile]
-            if crop.shape[0] < tile or crop.shape[1] < tile:
-                pad_h = tile - crop.shape[0]
-                pad_w = tile - crop.shape[1]
-                crop = cv2.copyMakeBorder(crop, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
-
-            res = run_yolo_single(crop, conf=conf, iou=iou, imgsz=imgsz, augment=augment, max_det=max_det)
-
-            if res.masks is not None and hasattr(res.masks, "xy"):
-                for poly in res.masks.xy:
-                    p = np.array(poly)
-                    p[:, 0] += x
-                    p[:, 1] += y
-                    all_polys.append(p)
-            elif res.masks is not None and hasattr(res.masks, "data"):
-                mdata = res.masks.data.cpu().numpy().astype(np.uint8)
-                for m in mdata:
-                    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    if not contours:
-                        continue
-                    cnt = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
-                    cnt[:, 0] += x
-                    cnt[:, 1] += y
-                    all_polys.append(cnt)
-
-            if res.boxes is not None and res.boxes.xyxy is not None:
-                boxes = res.boxes.xyxy.cpu().numpy()
-                scores = res.boxes.conf.cpu().numpy() if hasattr(res.boxes, "conf") and res.boxes.conf is not None else np.ones((boxes.shape[0],), dtype=float)
-                classes = res.boxes.cls.cpu().numpy() if hasattr(res.boxes, "cls") and res.boxes.cls is not None else np.zeros((boxes.shape[0],), dtype=float)
-                boxes[:, [0, 2]] += x
-                boxes[:, [1, 3]] += y
-                all_boxes.append(boxes)
-                all_scores.append(scores)
-                all_classes.append(classes)
-
-    if all_boxes:
-        all_boxes = np.vstack(all_boxes)
-        all_scores = np.concatenate(all_scores)
-        all_classes = np.concatenate(all_classes)
-        keep = nms_numpy(all_boxes, all_scores, iou_thresh=0.5)
-        all_boxes = all_boxes[keep]
-        all_scores = all_scores[keep]
-        all_classes = all_classes[keep]
+def export_image_from_imageserver(service_url: str, xmin: float, ymin: float, xmax: float, ymax: float,
+                                  target_mpp: Optional[float] = None, max_px: int = 3000) -> Tuple[np.ndarray, float, float]:
+    params = {
+        "f": "image",
+        "bbox": f"{xmin},{ymin},{xmax},{ymax}",
+        "bboxSR": 3857,
+        "imageSR": 3857,
+        "format": "png",
+        "transparent": "false",
+    }
+    w_m = xmax - xmin
+    h_m = ymax - ymin
+    if target_mpp:
+        params["pixelSize"] = f"{target_mpp},{target_mpp}"
     else:
-        all_boxes = np.empty((0, 4))
-        all_scores = np.empty((0,))
-        all_classes = np.empty((0,))
+        aspect = h_m / w_m
+        width_px = max(256, min(max_px, int(round(w_m / 0.3))))  # aim for ~30 cm if unknown
+        height_px = max(256, min(max_px, int(round(width_px * aspect))))
+        params["size"] = f"{width_px},{height_px}"
 
-    return all_boxes, all_scores, all_classes, all_polys
+    u = sanitize_service_url(service_url).rstrip("/")
+    if not u.lower().endswith("/exportimage"):
+        if u.lower().endswith("/imageserver"):
+            u = u + "/exportImage"
+        else:
+            u = u + "/exportImage"
 
+    r = requests.get(u, params=params, timeout=45)
+    # Retry with slightly coarser resolution if response is error JSON
+    if "image" not in r.headers.get("Content-Type", ""):
+        # try coarser
+        if target_mpp is not None:
+            params.pop("pixelSize", None)
+        aspect = h_m / w_m
+        width_px = max(256, min(max_px, int(round(w_m / 0.5))))  # 50 cm
+        height_px = max(256, min(max_px, int(round(width_px * aspect))))
+        params["size"] = f"{width_px},{height_px}"
+        r = requests.get(u, params=params, timeout=45)
+        if "image" not in r.headers.get("Content-Type", ""):
+            raise RuntimeError(f"ImageServer exportImage failed: {r.text[:300]}")
+
+    arr = np.frombuffer(r.content, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise RuntimeError("Failed to decode exportImage response.")
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.ndim == 3 and img.shape[2] > 3:
+        img = img[:, :, :3]
+    mpp_x = (xmax - xmin) / float(img.shape[1])
+    mpp_y = (ymax - ymin) / float(img.shape[0])
+    return img, mpp_x, mpp_y
+
+
+def export_map_from_mapserver(service_url: str, xmin: float, ymin: float, xmax: float, ymax: float,
+                              target_mpp: Optional[float] = None, max_px: int = 3000) -> Tuple[np.ndarray, float, float]:
+    params = {
+        "f": "image",
+        "bbox": f"{xmin},{ymin},{xmax},{ymax}",
+        "bboxSR": 3857,
+        "imageSR": 3857,
+        "format": "png",
+        "transparent": "false",
+    }
+    w_m = xmax - xmin
+    h_m = ymax - ymin
+    if target_mpp:
+        params["pixelSize"] = f"{target_mpp},{target_mpp}"
+    else:
+        aspect = h_m / w_m
+        width_px = max(256, min(max_px, int(round(w_m / 0.3))))
+        height_px = max(256, min(max_px, int(round(width_px * aspect))))
+        params["size"] = f"{width_px},{height_px}"
+
+    u = sanitize_service_url(service_url).rstrip("/")
+    if not u.lower().endswith("/export"):
+        if u.lower().endswith("/mapserver"):
+            u = u + "/export"
+        else:
+            u = u + "/export"
+
+    r = requests.get(u, params=params, timeout=45)
+    if "image" not in r.headers.get("Content-Type", ""):
+        # Try coarser/fallback
+        if target_mpp is not None:
+            params.pop("pixelSize", None)
+        aspect = h_m / w_m
+        width_px = max(256, min(max_px, int(round(w_m / 0.5))))
+        height_px = max(256, min(max_px, int(round(width_px * aspect))))
+        params["size"] = f"{width_px},{height_px}"
+        r = requests.get(u, params=params, timeout=45)
+        if "image" not in r.headers.get("Content-Type", ""):
+            raise RuntimeError(f"MapServer export failed: {r.text[:300]}")
+
+    arr = np.frombuffer(r.content, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise RuntimeError("Failed to decode MapServer export response.")
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.ndim == 3 and img.shape[2] > 3:
+        img = img[:, :, :3]
+    mpp_x = (xmax - xmin) / float(img.shape[1])
+    mpp_y = (ymax - ymin) / float(img.shape[0])
+    return img, mpp_x, mpp_y
+
+
+def pick_wms_layer_from_capabilities(cap_xml: str) -> Tuple[Optional[str], Optional[str]]:
+    # lightweight parse: pick first named, non-group layer preferring EPSG:3857 then EPSG:4326
+    import re
+    layers = re.findall(r"<Layer[^>]*>(.*?)</Layer>", cap_xml, flags=re.DOTALL | re.IGNORECASE)
+    for block in layers:
+        name_m = re.search(r"<Name>([^<]+)</Name>", block, flags=re.IGNORECASE)
+        if not name_m:
+            continue
+        name = name_m.group(1).strip()
+        crs_list = re.findall(r"<(CRS|SRS)>(EPSG:\d+)</(CRS|SRS)>", block, flags=re.IGNORECASE)
+        crs_vals = [m[1].upper() for m in crs_list]
+        if "EPSG:3857" in crs_vals:
+            return name, "EPSG:3857"
+        if "EPSG:4326" in crs_vals:
+            return name, "EPSG:4326"
+    return None, None
+
+
+def getmap_from_wms(wms_url: str, xmin: float, ymin: float, xmax: float, ymax: float,
+                    layer_name: Optional[str], img_format: str = "image/png", max_px: int = 3000) -> Tuple[np.ndarray, float, float]:
+    base = sanitize_service_url(wms_url)
+    # Ensure base ends with WMSServer
+    if "WMSServer" not in base and "wmsserver" not in base.lower():
+        if "WMSServer" in wms_url:
+            base = wms_url.split("?", 1)[0]
+        else:
+            # attempt to append
+            if not base.endswith("/"):
+                base += "/"
+            base += "WMSServer"
+
+    crs = "EPSG:3857"
+    version = "1.3.0"
+
+    # If no layer provided, fetch GetCapabilities and pick one
+    if not layer_name:
+        cap = requests.get(base, params={"service": "WMS", "request": "GetCapabilities"}, timeout=30)
+        if cap.status_code != 200:
+            raise RuntimeError("Failed to fetch WMS GetCapabilities; please provide layer name.")
+        ln, crs_sel = pick_wms_layer_from_capabilities(cap.text)
+        if not ln:
+            raise RuntimeError("Could not pick WMS layer; please provide layer name.")
+        layer_name = ln
+        if crs_sel:
+            crs = crs_sel
+
+    # Compute bbox param depending on CRS and version axis order rules
+    if crs == "EPSG:3857":
+        bbox_param = f"{xmin},{ymin},{xmax},{ymax}"
+    else:
+        # EPSG:4326 axis order in WMS 1.3.0 is lat,lon
+        min_lon, min_lat = webmerc_to_lonlat(xmin, ymin)
+        max_lon, max_lat = webmerc_to_lonlat(xmax, ymax)
+        if version == "1.3.0":
+            bbox_param = f"{min_lat},{min_lon},{max_lat},{max_lon}"
+        else:
+            bbox_param = f"{min_lon},{min_lat},{max_lon},{max_lat}"
+
+    w_m = xmax - xmin
+    h_m = ymax - ymin
+    aspect = h_m / max(w_m, 1e-9)
+    width_px = max(256, min(max_px, 2048))
+    height_px = max(256, min(max_px, int(round(width_px * aspect))))
+
+    params = {
+        "service": "WMS",
+        "request": "GetMap",
+        "version": version,
+        "layers": layer_name,
+        "styles": "",
+        "format": img_format,
+        "transparent": "false",
+        "crs": crs,
+        "bbox": bbox_param,
+        "width": width_px,
+        "height": height_px,
+    }
+
+    r = requests.get(base, params=params, timeout=45)
+    if "image" not in r.headers.get("Content-Type", ""):
+        # Try smaller request if server rejected size
+        width_px = max(256, int(width_px * 0.75))
+        height_px = max(256, int(height_px * 0.75))
+        params["width"], params["height"] = width_px, height_px
+        r = requests.get(base, params=params, timeout=45)
+        if "image" not in r.headers.get("Content-Type", ""):
+            raise RuntimeError(f"WMS GetMap failed: {r.text[:300]}")
+
+    arr = np.frombuffer(r.content, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise RuntimeError("Failed to decode WMS GetMap response.")
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.ndim == 3 and img.shape[2] > 3:
+        img = img[:, :, :3]
+
+    mpp_x = (xmax - xmin) / float(img.shape[1])
+    mpp_y = (ymax - ymin) / float(img.shape[0])
+    return img, mpp_x, mpp_y
+
+# --------------------------------------
+# Routes
+# --------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -290,46 +436,39 @@ def index():
 async def infer(
     file: UploadFile = File(...),
     meters_per_pixel: Optional[float] = Form(default=None),
-    conf: float = Form(default=0.2),
-    iou: float = Form(default=0.4),
+    conf: float = Form(default=0.25),
+    iou: float = Form(default=0.5),
     imgsz: int = Form(default=1280),
-    augment: bool = Form(default=False),
-    sharpen: bool = Form(default=False)
 ):
     try:
         data = await file.read()
         img = numpy_from_upload(data)
-        if sharpen:
-            img = unsharp_mask(img, radius=1.6, amount=0.8, threshold=0)
 
-        H, W = img.shape[:2]
-        if max(H, W) > 1500:
-            boxes, scores, classes, polygons = tile_inference_yolo(MODEL, img, tile=1024, overlap=256, imgsz=imgsz, conf=conf, iou=iou, augment=augment, max_det=5000)
-            result_img = draw_detections(img, polygons, boxes, scores)
-        else:
-            res = run_yolo_single(img, conf=conf, iou=iou, imgsz=imgsz, augment=augment, max_det=5000)
-            polygons: List[np.ndarray] = []
-            if res.masks is not None and hasattr(res.masks, "xy"):
-                for poly in res.masks.xy:
-                    polygons.append(np.array(poly))
-            elif res.masks is not None and hasattr(res.masks, "data"):
-                mdata = res.masks.data.cpu().numpy().astype(np.uint8)
-                for m in mdata:
-                    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    if not contours:
-                        polygons.append(None)
-                    else:
-                        cnt = max(contours, key=cv2.contourArea).reshape(-1, 2)
-                        polygons.append(cnt)
+        results = MODEL(img, conf=conf, iou=iou, imgsz=imgsz, verbose=False)
+        result = results[0]
 
-            boxes = None
-            scores = None
-            if res.boxes is not None and res.boxes.xyxy is not None:
-                boxes = res.boxes.xyxy.cpu().numpy()
-                if hasattr(res.boxes, "conf") and res.boxes.conf is not None:
-                    scores = res.boxes.conf.cpu().numpy()
+        polygons: List[np.ndarray] = []
+        if result.masks is not None and hasattr(result.masks, "xy"):
+            for poly in result.masks.xy:
+                polygons.append(np.array(poly))
+        elif result.masks is not None and hasattr(result.masks, "data"):
+            mdata = result.masks.data.cpu().numpy().astype(np.uint8)
+            for m in mdata:
+                contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not contours:
+                    polygons.append(None)
+                else:
+                    cnt = max(contours, key=cv2.contourArea).reshape(-1, 2)
+                    polygons.append(cnt)
 
-            result_img = draw_detections(res.orig_img if hasattr(res, "orig_img") else img, polygons, boxes, scores)
+        boxes = None
+        confs = None
+        if result.boxes is not None and result.boxes.xyxy is not None:
+            boxes = result.boxes.xyxy.cpu().numpy()
+            if hasattr(result.boxes, "conf") and result.boxes.conf is not None:
+                confs = result.boxes.conf.cpu().numpy()
+
+        vis = draw_detections(result.orig_img if hasattr(result, "orig_img") else img, polygons, boxes, confs)
 
         areas_px = polygon_areas_in_pixels(polygons)
         total_area_px = float(np.sum(areas_px))
@@ -338,9 +477,9 @@ async def infer(
         count = int(len([a for a in areas_px if a > 0]))
 
         if count == 0:
-            cv2.putText(result_img, "No panels detected", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3, cv2.LINE_AA)
+            cv2.putText(vis, "No panels detected", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3, cv2.LINE_AA)
 
-        png_bytes = encode_png(result_img)
+        png_bytes = encode_png(vis)
         b64 = base64.b64encode(png_bytes).decode("utf-8")
         data_url = f"data:image/png;base64,{b64}"
 
@@ -349,9 +488,7 @@ async def infer(
             "total_area_pixels": total_area_px,
             "meters_per_pixel": mpp,
             "total_area_m2": total_area_m2,
-            "used_augment": bool(augment),
-            "used_sharpen": bool(sharpen),
-            "image_data_url": data_url
+            "image_data_url": data_url,
         })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -363,52 +500,44 @@ async def infer_naip(
     min_lat: float = Form(...),
     max_lon: float = Form(...),
     max_lat: float = Form(...),
-    width_px: int = Form(2048),
-    use_usgs: bool = Form(True),
-    conf: float = Form(0.2),
-    iou: float = Form(0.4),
+    width_px: int = Form(1024),
+    use_usgs: bool = Form(True),  # True=USGS, False=USDA
+    conf: float = Form(0.25),
+    iou: float = Form(0.5),
     imgsz: int = Form(1280),
-    augment: bool = Form(default=False),
-    sharpen: bool = Form(default=False)
 ):
     """
     Fetch NAIP via ArcGIS ImageServer for the given lon/lat bbox, then run detection.
-    Options: augment (TTA) and unsharp mask to improve small residential panel recall.
     """
     try:
         xmin, ymin, xmax, ymax = bbox4326_to_3857(min_lon, min_lat, max_lon, max_lat)
         img, mpp_x, mpp_y = fetch_naip_bbox_mercator(xmin, ymin, xmax, ymax, width_px=width_px, use_usgs=use_usgs)
-        img = to_3ch_bgr(img)
-        if sharpen:
-            img = unsharp_mask(img, radius=1.6, amount=0.8, threshold=0)
 
-        H, W = img.shape[:2]
-        if max(H, W) > 1500:
-            boxes, scores, classes, polygons = tile_inference_yolo(MODEL, img, tile=1024, overlap=256, imgsz=imgsz, conf=conf, iou=iou, augment=augment, max_det=5000)
-            vis = draw_detections(img, polygons, boxes, scores)
-        else:
-            res = run_yolo_single(img, conf=conf, iou=iou, imgsz=imgsz, augment=augment, max_det=5000)
-            polygons: List[np.ndarray] = []
-            if res.masks is not None and hasattr(res.masks, "xy"):
-                for poly in res.masks.xy:
-                    polygons.append(np.array(poly))
-            elif res.masks is not None and hasattr(res.masks, "data"):
-                mdata = res.masks.data.cpu().numpy().astype(np.uint8)
-                for m in mdata:
-                    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    if not contours:
-                        polygons.append(None)
-                    else:
-                        cnt = max(contours, key=cv2.contourArea).reshape(-1, 2)
-                        polygons.append(cnt)
+        results = MODEL(img, conf=conf, iou=iou, imgsz=imgsz, verbose=False)
+        result = results[0]
 
-            boxes = None
-            scores = None
-            if res.boxes is not None and res.boxes.xyxy is not None:
-                boxes = res.boxes.xyxy.cpu().numpy()
-                if hasattr(res.boxes, "conf") and res.boxes.conf is not None:
-                    scores = res.boxes.conf.cpu().numpy()
-            vis = draw_detections(res.orig_img if hasattr(res, "orig_img") else img, polygons, boxes, scores)
+        polygons: List[np.ndarray] = []
+        if result.masks is not None and hasattr(result.masks, "xy"):
+            for poly in result.masks.xy:
+                polygons.append(np.array(poly))
+        elif result.masks is not None and hasattr(result.masks, "data"):
+            mdata = result.masks.data.cpu().numpy().astype(np.uint8)
+            for m in mdata:
+                contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not contours:
+                    polygons.append(None)
+                else:
+                    cnt = max(contours, key=cv2.contourArea).reshape(-1, 2)
+                    polygons.append(cnt)
+
+        boxes = None
+        confs = None
+        if result.boxes is not None and result.boxes.xyxy is not None:
+            boxes = result.boxes.xyxy.cpu().numpy()
+            if hasattr(result.boxes, "conf") and result.boxes.conf is not None:
+                confs = result.boxes.conf.cpu().numpy()
+
+        vis = draw_detections(result.orig_img if hasattr(result, "orig_img") else img, polygons, boxes, confs)
 
         areas_px = polygon_areas_in_pixels(polygons)
         total_area_px = float(np.sum(areas_px))
@@ -429,9 +558,96 @@ async def infer_naip(
             "mpp_y": mpp_y,
             "total_area_m2": total_area_m2,
             "export_bbox_3857": [xmin, ymin, xmax, ymax],
-            "used_augment": bool(augment),
-            "used_sharpen": bool(sharpen),
-            "image_data_url": data_url
+            "image_data_url": data_url,
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@app.post("/infer_generic_imagery")
+async def infer_generic_imagery(
+    service_url: str = Form(...),
+    min_lon: float = Form(...),
+    min_lat: float = Form(...),
+    max_lon: float = Form(...),
+    max_lat: float = Form(...),
+    service_type: str = Form(default="auto"),  # auto | image_server | map_server | wms
+    wms_layer: Optional[str] = Form(default=None),
+    target_mpp: Optional[float] = Form(default=None),
+    conf: float = Form(default=0.25),
+    iou: float = Form(default=0.5),
+    imgsz: int = Form(default=1280),
+):
+    try:
+        xmin, ymin, xmax, ymax = bbox4326_to_3857(min_lon, min_lat, max_lon, max_lat)
+        su = sanitize_service_url(service_url)
+        st = (service_type or "auto").lower()
+
+        if st == "auto":
+            low = su.lower()
+            if "imageserver" in low:
+                st = "image_server"
+            elif "mapserver" in low:
+                st = "map_server"
+            elif "wmsserver" in low or "service=wms" in low or "request=getcapabilities" in low:
+                st = "wms"
+            else:
+                # heuristic: try ImageServer export first
+                st = "image_server"
+
+        # Fetch image per type
+        if st == "image_server":
+            img, mpp_x, mpp_y = export_image_from_imageserver(su, xmin, ymin, xmax, ymax, target_mpp=target_mpp)
+        elif st == "map_server":
+            img, mpp_x, mpp_y = export_map_from_mapserver(su, xmin, ymin, xmax, ymax, target_mpp=target_mpp)
+        elif st == "wms":
+            img, mpp_x, mpp_y = getmap_from_wms(su, xmin, ymin, xmax, ymax, layer_name=wms_layer)
+        else:
+            return JSONResponse({"error": "Unsupported service type"}, status_code=400)
+
+        # Run model
+        results = MODEL(img, conf=conf, iou=iou, imgsz=imgsz, verbose=False)
+        result = results[0]
+
+        polygons: List[np.ndarray] = []
+        if result.masks is not None and hasattr(result.masks, "xy"):
+            for poly in result.masks.xy:
+                polygons.append(np.array(poly))
+        elif result.masks is not None and hasattr(result.masks, "data"):
+            mdata = result.masks.data.cpu().numpy().astype(np.uint8)
+            for m in mdata:
+                contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                polygons.append(max(contours, key=cv2.contourArea).reshape(-1, 2) if contours else None)
+
+        boxes = None
+        confs = None
+        if result.boxes is not None and result.boxes.xyxy is not None:
+            boxes = result.boxes.xyxy.cpu().numpy()
+            if hasattr(result.boxes, "conf") and result.boxes.conf is not None:
+                confs = result.boxes.conf.cpu().numpy()
+
+        vis = draw_detections(result.orig_img if hasattr(result, "orig_img") else img, polygons, boxes, confs)
+        areas_px = polygon_areas_in_pixels(polygons)
+        total_area_px = float(np.sum(areas_px))
+        total_area_m2 = total_area_px * (mpp_x * mpp_y)
+        count = int(len([a for a in areas_px if a > 0]))
+        if count == 0:
+            cv2.putText(vis, "No panels detected", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3, cv2.LINE_AA)
+
+        png_bytes = encode_png(vis)
+        b64 = base64.b64encode(png_bytes).decode("utf-8")
+        data_url = f"data:image/png;base64,{b64}"
+
+        return JSONResponse({
+            "count": count,
+            "total_area_pixels": total_area_px,
+            "mpp_x": mpp_x,
+            "mpp_y": mpp_y,
+            "total_area_m2": total_area_m2,
+            "export_bbox_3857": [xmin, ymin, xmax, ymax],
+            "source_service_url": su,
+            "image_data_url": data_url,
+            "service_type": st,
         })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
