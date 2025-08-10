@@ -1,4 +1,5 @@
 <!-- Map-based NAIP fetch and inference with enhanced UX (with augment+sharpen+High Recall) -->
+
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
 <style>
@@ -11,6 +12,16 @@
   #result_img { width: 100%; display:none; border: 1px solid #ddd; border-radius: 6px; }
   #result_map { height: 520px; display:none; border: 1px solid #ddd; border-radius: 6px; }
   .badge { display:inline-block; padding:2px 6px; border-radius:10px; background:#eef; color:#334; font-size:12px; margin-left:6px; }
+  #detections_table_container { margin-top: 10px; max-height: 200px; overflow-y: auto; }
+  #detections_table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  #detections_table th, #detections_table td {
+    border: 1px solid #ccc;
+    padding: 4px 8px;
+    text-align: center;
+  }
+  #detections_table th {
+    background-color: #f0f0f0;
+  }
 </style>
 
 <div>
@@ -21,7 +32,7 @@
     <div class="row">
       <label>Basemap:
         <select id="basemap">
-          <option value="esri" selected>ESRI World Imagery</option>
+          <option value="hybrid" selected>ESRI World Imagery Hybrid</option>
           <option value="osm">OpenStreetMap</option>
         </select>
       </label>
@@ -59,32 +70,50 @@
     <img id="result_img" alt="Result image" />
     <div id="result_map"></div>
   </div>
+
+  <div id="detections_table_container" style="display:none;">
+    <h4>Detections</h4>
+    <table id="detections_table" border="1">
+      <thead>
+        <tr><th>#</th><th>Confidence</th><th>Latitude</th><th>Longitude</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
 <script>
-  // Map setup: start over U.S. with ESRI World Imagery
+  // Map setup: start over U.S. with ESRI hybrid imagery by default
   const usaCenter = [39.5, -98.35];
   const map = L.map('map', { zoomControl: true }).setView(usaCenter, 4);
 
-  const esri = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-    attribution: 'Tiles © Esri & contributors'
-  }).addTo(map);
+  const esriImagery = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    attribution: 'Tiles &copy; Esri & contributors'
+  });
+
+  const esriLabels = L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
+    attribution: 'Labels &copy; Esri'
+  });
+
+  const hybrid = L.layerGroup([esriImagery, esriLabels]);
 
   const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19,
-    attribution: '© OpenStreetMap'
+    attribution: '&copy; OpenStreetMap contributors'
   });
+
+  hybrid.addTo(map);
 
   document.getElementById('basemap').addEventListener('change', (e) => {
     const val = e.target.value;
-    if (val === 'esri') {
-      map.addLayer(esri);
-      map.removeLayer(osm);
+    if (val === 'hybrid') {
+      map.eachLayer(layer => map.removeLayer(layer));
+      hybrid.addTo(map);
     } else {
-      map.addLayer(osm);
-      map.removeLayer(esri);
+      map.eachLayer(layer => map.removeLayer(layer));
+      osm.addTo(map);
     }
   });
 
@@ -173,7 +202,6 @@
     const resultMapEl = document.getElementById('result_map');
     resultMapEl.style.display = 'block';
 
-    // Remove previous map if exists
     if (window.resultMap) {
       window.resultMap.remove();
     }
@@ -181,12 +209,33 @@
     window.resultMap = L.map('result_map', { zoomControl: true, attributionControl: false });
     const imageBounds = L.latLngBounds([bounds.getSouth(), bounds.getWest()], [bounds.getNorth(), bounds.getEast()]);
 
-    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-      attribution: 'Tiles © Esri & contributors'
-    }).addTo(window.resultMap);
+    // Using hybrid base for result map as well
+    const esriImageryRes = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      attribution: 'Tiles &copy; Esri & contributors'
+    });
+    const esriLabelsRes = L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
+      attribution: 'Labels &copy; Esri'
+    });
+    L.layerGroup([esriImageryRes, esriLabelsRes]).addTo(window.resultMap);
 
     L.imageOverlay(data.image_data_url, imageBounds, { opacity: 1.0 }).addTo(window.resultMap);
     window.resultMap.fitBounds(imageBounds);
+  }
+
+  function populateDetectionsTable(detections) {
+    const container = document.getElementById('detections_table_container');
+    const tbody = document.querySelector("#detections_table tbody");
+    tbody.innerHTML = "";  // Clear existing rows
+    if (!detections || detections.length === 0) {
+      container.style.display = 'none';
+      return;
+    }
+    container.style.display = 'block';
+    detections.forEach((det, i) => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${i+1}</td><td>${(det.score*100).toFixed(1)}%</td><td>${det.lat.toFixed(6)}</td><td>${det.lon.toFixed(6)}</td>`;
+      tbody.appendChild(tr);
+    });
   }
 
   document.getElementById('preset_high_recall').addEventListener('click', () => {
@@ -221,6 +270,7 @@
     imgEl.style.display = 'none';
     resultMapEl.style.display = 'none';
     resultMapEl.innerHTML = '';
+    populateDetectionsTable([]);  // Clear previous detections
 
     try {
       const data = await postInferNAIP(bounds, params);
@@ -232,6 +282,9 @@
       showResultOnMap(data, bounds);
 
       status.textContent = `Detections: ${data.count} | Total area (px): ${Math.round(data.total_area_pixels)} | mpp_x: ${data.mpp_x?.toFixed?.(3)} m | mpp_y: ${data.mpp_y?.toFixed?.(3)} m | Augment: ${params.augment} | Sharpen: ${params.sharpen}`;
+
+      // Populate detections table with detections array (expects lat, lon, score)
+      populateDetectionsTable(data.detections);
     } catch (err) {
       console.error(err);
       status.textContent = 'Error: ' + (err.message || err);
