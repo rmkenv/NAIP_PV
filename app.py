@@ -38,16 +38,23 @@ BOX_COLOR = (40, 180, 255)    # BGR orange
 TEXT_COLOR = (255, 255, 255)
 
 
+def to_rgb_bgr(img_bgr: np.ndarray) -> np.ndarray:
+    """Ensure 3-channel BGR (drop extra channels, expand gray)."""
+    if img_bgr is None:
+        raise ValueError("Empty image")
+    if img_bgr.ndim == 2:
+        img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2BGR)
+    if img_bgr.ndim == 3 and img_bgr.shape[2] > 3:
+        img_bgr = img_bgr[:, :, :3]
+    return img_bgr
+
+
 def numpy_from_upload(file_bytes: bytes) -> np.ndarray:
     arr = np.frombuffer(file_bytes, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise ValueError("Could not decode image. Please upload a valid PNG/JPG.")
-    # Some NAIP PNGs have 4 channels (RGB + NIR or alpha). Drop to 3-channel.
-    if img.ndim == 3 and img.shape[2] > 3:
-        img = img[:, :, :3]
-    if img.ndim == 2:
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    img = to_rgb_bgr(img)
     return img
 
 
@@ -122,7 +129,7 @@ USDA_NAIP_EXPORT = "https://gis.apfo.usda.gov/arcgis/rest/services/NAIP/USDA_CON
 
 def fetch_naip_bbox_mercator(
     xmin: float, ymin: float, xmax: float, ymax: float,
-    width_px: int = 1536,
+    width_px: int = 2048,
     use_usgs: bool = True
 ) -> Tuple[np.ndarray, float, float]:
     """
@@ -130,14 +137,14 @@ def fetch_naip_bbox_mercator(
     Returns (image_bgr, mpp_x, mpp_y) where mpp is meters per pixel.
     """
     # Keep size within service limits (MaxImageWidth/Height ~4000)
-    width_px = int(max(256, min(3000, width_px)))
+    width_px = int(max(512, min(3500, width_px)))
     w_m = xmax - xmin
     h_m = ymax - ymin
     if w_m <= 0 or h_m <= 0:
         raise ValueError("Invalid bbox.")
     aspect = h_m / w_m
     height_px = int(round(width_px * aspect))
-    height_px = max(256, min(3000, height_px))
+    height_px = max(512, min(3500, height_px))
 
     params = {
         "f": "image",
@@ -148,13 +155,11 @@ def fetch_naip_bbox_mercator(
         "format": "png",
     }
     url = USGS_NAIP_EXPORT if use_usgs else USDA_NAIP_EXPORT
-    resp = requests.get(url, params=params, timeout=30)
+    resp = requests.get(url, params=params, timeout=45)
     if resp.status_code != 200 or not resp.content:
         raise RuntimeError(f"ExportImage failed: HTTP {resp.status_code}")
-    # The service returns image bytes when f=image. If an error, it often returns small HTML/JSON.
     content_type = resp.headers.get("Content-Type", "")
     if "image" not in content_type:
-        # try to surface error message
         text = resp.text[:500]
         raise RuntimeError(f"ExportImage returned non-image response: {text}")
 
@@ -162,15 +167,117 @@ def fetch_naip_bbox_mercator(
     img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise RuntimeError("Failed to decode image from ImageServer.")
-    if img.ndim == 2:
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    if img.ndim == 3 and img.shape[2] > 3:
-        img = img[:, :, :3]
+    img = to_rgb_bgr(img)
 
     # meters per pixel in x and y
     mpp_x = w_m / float(img.shape[1])
     mpp_y = h_m / float(img.shape[0])
     return img, mpp_x, mpp_y
+
+
+# ---------- YOLO inference helpers (tiling for small objects) ----------
+
+def run_yolo_single(img_bgr: np.ndarray, conf: float, iou: float, imgsz: int):
+    return MODEL(img_bgr, conf=conf, iou=iou, imgsz=imgsz, verbose=False)[0]
+
+
+def nms_numpy(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float = 0.5) -> np.ndarray:
+    if boxes.size == 0:
+        return np.empty((0,), dtype=int)
+    idxs = scores.argsort()[::-1]
+    keep = []
+    while idxs.size > 0:
+        i = idxs[0]
+        keep.append(i)
+        if idxs.size == 1:
+            break
+        rest = idxs[1:]
+        ious = iou_with(boxes[i], boxes[rest])
+        idxs = rest[ious < iou_thresh]
+    return np.array(keep, dtype=int)
+
+
+def iou_with(box: np.ndarray, boxes: np.ndarray) -> np.ndarray:
+    x1 = np.maximum(box[0], boxes[:, 0])
+    y1 = np.maximum(box[1], boxes[:, 1])
+    x2 = np.minimum(box[2], boxes[:, 2])
+    y2 = np.minimum(box[3], boxes[:, 3])
+    inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
+    area1 = (box[2] - box[0]) * (box[3] - box[1])
+    area2 = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    union = area1 + area2 - inter + 1e-6
+    return inter / union
+
+
+def tile_inference_yolo(
+    model,
+    img_bgr: np.ndarray,
+    tile: int = 1024,
+    overlap: int = 256,
+    imgsz: int = 1280,
+    conf: float = 0.2,
+    iou: float = 0.4
+):
+    H, W = img_bgr.shape[:2]
+    stride = max(1, tile - overlap)
+    all_boxes = []
+    all_scores = []
+    all_classes = []
+    all_polys = []
+
+    for y in range(0, max(H - tile, 0) + 1, stride):
+        for x in range(0, max(W - tile, 0) + 1, stride):
+            crop = img_bgr[y:y + tile, x:x + tile]
+            # pad edge tiles with reflect to keep content scale
+            if crop.shape[0] < tile or crop.shape[1] < tile:
+                pad_h = tile - crop.shape[0]
+                pad_w = tile - crop.shape[1]
+                crop = cv2.copyMakeBorder(crop, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+
+            res = run_yolo_single(crop, conf=conf, iou=iou, imgsz=imgsz)
+
+            # Masks to polygons (tile coords)
+            if res.masks is not None and hasattr(res.masks, "xy"):
+                for poly in res.masks.xy:
+                    p = np.array(poly)
+                    p[:, 0] += x
+                    p[:, 1] += y
+                    all_polys.append(p)
+            elif res.masks is not None and hasattr(res.masks, "data"):
+                mdata = res.masks.data.cpu().numpy().astype(np.uint8)
+                for m in mdata:
+                    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if not contours:
+                        continue
+                    cnt = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
+                    cnt[:, 0] += x
+                    cnt[:, 1] += y
+                    all_polys.append(cnt)
+
+            if res.boxes is not None and res.boxes.xyxy is not None:
+                boxes = res.boxes.xyxy.cpu().numpy()
+                scores = res.boxes.conf.cpu().numpy() if hasattr(res.boxes, "conf") and res.boxes.conf is not None else np.ones((boxes.shape[0],), dtype=float)
+                classes = res.boxes.cls.cpu().numpy() if hasattr(res.boxes, "cls") and res.boxes.cls is not None else np.zeros((boxes.shape[0],), dtype=float)
+                boxes[:, [0, 2]] += x
+                boxes[:, [1, 3]] += y
+                all_boxes.append(boxes)
+                all_scores.append(scores)
+                all_classes.append(classes)
+
+    if all_boxes:
+        all_boxes = np.vstack(all_boxes)
+        all_scores = np.concatenate(all_scores)
+        all_classes = np.concatenate(all_classes)
+        keep = nms_numpy(all_boxes, all_scores, iou_thresh=0.5)
+        all_boxes = all_boxes[keep]
+        all_scores = all_scores[keep]
+        all_classes = all_classes[keep]
+    else:
+        all_boxes = np.empty((0, 4))
+        all_scores = np.empty((0,))
+        all_classes = np.empty((0,))
+
+    return all_boxes, all_scores, all_classes, all_polys
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -182,39 +289,43 @@ def index():
 async def infer(
     file: UploadFile = File(...),
     meters_per_pixel: Optional[float] = Form(default=None),
-    conf: float = Form(default=0.25),
-    iou: float = Form(default=0.5),
+    conf: float = Form(default=0.2),
+    iou: float = Form(default=0.4),
     imgsz: int = Form(default=1280)
 ):
     try:
         data = await file.read()
         img = numpy_from_upload(data)
 
-        results = MODEL(img, conf=conf, iou=iou, imgsz=imgsz, verbose=False)
-        result = results[0]
+        H, W = img.shape[:2]
+        # If large image, use tiling to preserve small objects
+        if max(H, W) > 1500:
+            boxes, scores, classes, polygons = tile_inference_yolo(MODEL, img, tile=1024, overlap=256, imgsz=imgsz, conf=conf, iou=iou)
+            result_img = draw_detections(img, polygons, boxes, scores)
+        else:
+            res = run_yolo_single(img, conf=conf, iou=iou, imgsz=imgsz)
+            polygons: List[np.ndarray] = []
+            if res.masks is not None and hasattr(res.masks, "xy"):
+                for poly in res.masks.xy:
+                    polygons.append(np.array(poly))
+            elif res.masks is not None and hasattr(res.masks, "data"):
+                mdata = res.masks.data.cpu().numpy().astype(np.uint8)
+                for m in mdata:
+                    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if not contours:
+                        polygons.append(None)
+                    else:
+                        cnt = max(contours, key=cv2.contourArea).reshape(-1, 2)
+                        polygons.append(cnt)
 
-        polygons: List[np.ndarray] = []
-        if result.masks is not None and hasattr(result.masks, "xy"):
-            for poly in result.masks.xy:
-                polygons.append(np.array(poly))
-        elif result.masks is not None and hasattr(result.masks, "data"):
-            mdata = result.masks.data.cpu().numpy().astype(np.uint8)
-            for m in mdata:
-                contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if not contours:
-                    polygons.append(None)
-                else:
-                    cnt = max(contours, key=cv2.contourArea).reshape(-1, 2)
-                    polygons.append(cnt)
+            boxes = None
+            scores = None
+            if res.boxes is not None and res.boxes.xyxy is not None:
+                boxes = res.boxes.xyxy.cpu().numpy()
+                if hasattr(res.boxes, "conf") and res.boxes.conf is not None:
+                    scores = res.boxes.conf.cpu().numpy()
 
-        boxes = None
-        confs = None
-        if result.boxes is not None and result.boxes.xyxy is not None:
-            boxes = result.boxes.xyxy.cpu().numpy()
-            if hasattr(result.boxes, "conf") and result.boxes.conf is not None:
-                confs = result.boxes.conf.cpu().numpy()
-
-        vis = draw_detections(result.orig_img if hasattr(result, "orig_img") else img, polygons, boxes, confs)
+            result_img = draw_detections(res.orig_img if hasattr(res, "orig_img") else img, polygons, boxes, scores)
 
         areas_px = polygon_areas_in_pixels(polygons)
         total_area_px = float(np.sum(areas_px))
@@ -223,9 +334,9 @@ async def infer(
         count = int(len([a for a in areas_px if a > 0]))
 
         if count == 0:
-            cv2.putText(vis, "No panels detected", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3, cv2.LINE_AA)
+            cv2.putText(result_img, "No panels detected", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3, cv2.LINE_AA)
 
-        png_bytes = encode_png(vis)
+        png_bytes = encode_png(result_img)
         b64 = base64.b64encode(png_bytes).decode("utf-8")
         data_url = f"data:image/png;base64,{b64}"
 
@@ -246,51 +357,53 @@ async def infer_naip(
     min_lat: float = Form(...),
     max_lon: float = Form(...),
     max_lat: float = Form(...),
-    width_px: int = Form(1024),
+    width_px: int = Form(2048),
     use_usgs: bool = Form(True),  # True=USGS, False=USDA
-    conf: float = Form(0.25),
-    iou: float = Form(0.5),
+    conf: float = Form(0.2),
+    iou: float = Form(0.4),
     imgsz: int = Form(1280)
 ):
     """
     Fetch NAIP via ArcGIS ImageServer for the given lon/lat bbox, then run detection.
+    Uses bigger export size and tiling to improve small-object recall.
     """
     try:
         xmin, ymin, xmax, ymax = bbox4326_to_3857(min_lon, min_lat, max_lon, max_lat)
         img, mpp_x, mpp_y = fetch_naip_bbox_mercator(xmin, ymin, xmax, ymax, width_px=width_px, use_usgs=use_usgs)
+        img = to_rgb_bgr(img)
 
-        # Run model
-        results = MODEL(img, conf=conf, iou=iou, imgsz=imgsz, verbose=False)
-        result = results[0]
+        H, W = img.shape[:2]
+        # Always use tiling for NAIP fetches if larger than ~1500 px to catch small panels
+        if max(H, W) > 1500:
+            boxes, scores, classes, polygons = tile_inference_yolo(MODEL, img, tile=1024, overlap=256, imgsz=imgsz, conf=conf, iou=iou)
+            vis = draw_detections(img, polygons, boxes, scores)
+        else:
+            res = run_yolo_single(img, conf=conf, iou=iou, imgsz=imgsz)
+            polygons: List[np.ndarray] = []
+            if res.masks is not None and hasattr(res.masks, "xy"):
+                for poly in res.masks.xy:
+                    polygons.append(np.array(poly))
+            elif res.masks is not None and hasattr(res.masks, "data"):
+                mdata = res.masks.data.cpu().numpy().astype(np.uint8)
+                for m in mdata:
+                    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if not contours:
+                        polygons.append(None)
+                    else:
+                        cnt = max(contours, key=cv2.contourArea).reshape(-1, 2)
+                        polygons.append(cnt)
 
-        # Extract polygons and boxes
-        polygons: List[np.ndarray] = []
-        if result.masks is not None and hasattr(result.masks, "xy"):
-            for poly in result.masks.xy:
-                polygons.append(np.array(poly))
-        elif result.masks is not None and hasattr(result.masks, "data"):
-            mdata = result.masks.data.cpu().numpy().astype(np.uint8)
-            for m in mdata:
-                contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if not contours:
-                    polygons.append(None)
-                else:
-                    cnt = max(contours, key=cv2.contourArea).reshape(-1, 2)
-                    polygons.append(cnt)
-
-        boxes = None
-        confs = None
-        if result.boxes is not None and result.boxes.xyxy is not None:
-            boxes = result.boxes.xyxy.cpu().numpy()
-            if hasattr(result.boxes, "conf") and result.boxes.conf is not None:
-                confs = result.boxes.conf.cpu().numpy()
-
-        vis = draw_detections(result.orig_img if hasattr(result, "orig_img") else img, polygons, boxes, confs)
+            boxes = None
+            scores = None
+            if res.boxes is not None and res.boxes.xyxy is not None:
+                boxes = res.boxes.xyxy.cpu().numpy()
+                if hasattr(res.boxes, "conf") and res.boxes.conf is not None:
+                    scores = res.boxes.conf.cpu().numpy()
+            vis = draw_detections(res.orig_img if hasattr(res, "orig_img") else img, polygons, boxes, scores)
 
         # Areas
         areas_px = polygon_areas_in_pixels(polygons)
         total_area_px = float(np.sum(areas_px))
-        # Area conversion uses mpp_x * mpp_y to account for non-square pixels if any
         total_area_m2 = total_area_px * (mpp_x * mpp_y)
         count = int(len([a for a in areas_px if a > 0]))
 
