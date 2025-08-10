@@ -1,0 +1,226 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Solar Panel Detector (NAIP)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
+      .card { max-width: 1080px; margin: 0 auto; padding: 16px; border: 1px solid #ddd; border-radius: 8px; }
+      h1 { font-size: 22px; margin: 0 0 12px; }
+      h2 { font-size: 18px; margin: 20px 0 10px; }
+      label { display: block; margin: 10px 0 6px; }
+      input[type="file"] { padding: 6px 0; }
+      input[type="number"], input[type="text"] { width: 220px; padding: 6px; }
+      button { padding: 10px 16px; cursor: pointer; }
+      .row { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
+      .col { flex: 1 1 360px; }
+      .preview { border: 1px solid #ccc; border-radius: 4px; padding: 8px; }
+      img { max-width: 100%; height: auto; display: block; }
+      .meta { margin-top: 8px; font-size: 14px; }
+      .hint { color: #666; font-size: 12px; }
+      .footer { color: #666; font-size: 12px; margin-top: 10px; }
+      .err { color: #b00020; }
+      .grid { display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 10px 16px; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Solar Panel Detector (NAIP)</h1>
+
+      <h2>Option A: Upload an image</h2>
+      <form id="form-upload">
+        <label for="file">NAIP image (PNG/JPG):</label>
+        <input id="file" type="file" accept="image/png,image/jpeg" required />
+
+        <label for="mpp">Meters per pixel (optional):</label>
+        <input id="mpp" type="number" step="0.01" min="0" placeholder="e.g., 1.0 or 1.25" />
+        <div class="hint">If unknown, leave blank. Area will be in pixels² unless m/px is provided.</div>
+
+        <div style="margin-top: 12px;">
+          <label for="conf">Confidence threshold (default 0.25):</label>
+          <input id="conf" type="number" step="0.01" min="0" max="1" value="0.25" />
+        </div>
+        <div style="margin-top: 8px;">
+          <label for="iou">NMS IoU threshold (default 0.5):</label>
+          <input id="iou" type="number" step="0.01" min="0" max="1" value="0.5" />
+        </div>
+
+        <div style="margin-top: 16px;">
+          <button type="submit">Detect panels</button>
+        </div>
+      </form>
+
+      <h2>Option B: Fetch NAIP by bounding box</h2>
+      <form id="form-naip">
+        <div class="grid">
+          <div>
+            <label for="min_lon">Min longitude (°):</label>
+            <input id="min_lon" type="number" step="0.000001" min="-180" max="180" placeholder="-122.337" required />
+          </div>
+          <div>
+            <label for="min_lat">Min latitude (°):</label>
+            <input id="min_lat" type="number" step="0.000001" min="-85" max="85" placeholder="47.610" required />
+          </div>
+          <div>
+            <label for="max_lon">Max longitude (°):</label>
+            <input id="max_lon" type="number" step="0.000001" min="-180" max="180" placeholder="-122.329" required />
+          </div>
+          <div>
+            <label for="max_lat">Max latitude (°):</label>
+            <input id="max_lat" type="number" step="0.000001" min="-85" max="85" placeholder="47.616" required />
+          </div>
+          <div>
+            <label for="width_px">Export width (pixels):</label>
+            <input id="width_px" type="number" step="1" min="256" max="3000" value="1024" />
+          </div>
+          <div>
+            <label for="use_usgs">Source:</label>
+            <select id="use_usgs">
+              <option value="true" selected>USGS NAIP (The National Map)</option>
+              <option value="false">USDA NAIP (USDA CONUS PRIME)</option>
+            </select>
+          </div>
+          <div>
+            <label for="conf2">Confidence (default 0.25):</label>
+            <input id="conf2" type="number" step="0.01" min="0" max="1" value="0.25" />
+          </div>
+          <div>
+            <label for="iou2">NMS IoU (default 0.5):</label>
+            <input id="iou2" type="number" step="0.01" min="0" max="1" value="0.5" />
+          </div>
+        </div>
+        <div class="hint">
+          NAIP imagery is fetched via ArcGIS ImageServer Export Image (not WFS).
+          USGS NAIP: <a href="https://imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPImagery/ImageServer" target="_blank">link</a>,
+          USDA NAIP: <a href="https://gis.apfo.usda.gov/arcgis/rest/services/NAIP/USDA_CONUS_PRIME/ImageServer" target="_blank">link</a>.
+        </div>
+        <div style="margin-top: 12px;">
+          <button type="submit">Fetch NAIP + Detect</button>
+        </div>
+      </form>
+
+      <div id="status" class="meta"></div>
+
+      <div class="row" style="margin-top: 16px;">
+        <div class="col">
+          <div class="preview">
+            <div class="meta"><strong>Result:</strong></div>
+            <img id="result" alt="Result will appear here" />
+          </div>
+        </div>
+        <div class="col">
+          <div class="preview">
+            <div class="meta"><strong>Metrics:</strong></div>
+            <div id="metrics"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="footer">
+        Model: YOLOv8s segmentation trained for solar panels
+        (<a href="https://huggingface.co/finloop/yolov8s-seg-solar-panels" target="_blank">Hugging Face</a>).
+        NAIP services: USGS ImageServer
+        (<a href="https://imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPImagery/ImageServer" target="_blank">link</a>),
+        USDA ImageServer
+        (<a href="https://gis.apfo.usda.gov/arcgis/rest/services/NAIP/USDA_CONUS_PRIME/ImageServer" target="_blank">link</a>).
+      </div>
+    </div>
+
+    <script>
+      const statusDiv = document.getElementById('status');
+      const resultImg = document.getElementById('result');
+      const metricsDiv = document.getElementById('metrics');
+
+      function showMetricsFromResponse(data, mode) {
+        const lines = [];
+        lines.push(`Detections: ${data.count}`);
+        lines.push(`Total area (pixels²): ${Math.round(data.total_area_pixels)}`);
+        if (mode === 'upload') {
+          if (data.meters_per_pixel) {
+            lines.push(`Meters per pixel: ${data.meters_per_pixel}`);
+            lines.push(`Estimated area (m²): ${data.total_area_m2 ? data.total_area_m2.toFixed(2) : 'N/A'}`);
+          } else {
+            lines.push('Estimated area (m²): provide meters-per-pixel for area.');
+          }
+        } else if (mode === 'naip') {
+          lines.push(`mpp_x: ${data.mpp_x.toFixed(4)} m/px`);
+          lines.push(`mpp_y: ${data.mpp_y.toFixed(4)} m/px`);
+          lines.push(`Estimated area (m²): ${data.total_area_m2 ? data.total_area_m2.toFixed(2) : 'N/A'}`);
+        }
+        metricsDiv.innerHTML = '<pre>' + lines.join('\n') + '</pre>';
+        resultImg.src = data.image_data_url;
+      }
+
+      // Upload form
+      document.getElementById('form-upload').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        metricsDiv.textContent = '';
+        resultImg.src = '';
+        statusDiv.textContent = 'Running detection...';
+
+        const file = document.getElementById('file').files[0];
+        if (!file) {
+          statusDiv.innerHTML = '<span class="err">Please choose an image.</span>';
+          return;
+        }
+        const conf = document.getElementById('conf').value || '0.25';
+        const iou = document.getElementById('iou').value || '0.5';
+        const mppVal = document.getElementById('mpp').value.trim();
+
+        const fd = new FormData();
+        fd.append('file', file);
+        fd.append('conf', conf);
+        fd.append('iou', iou);
+        if (mppVal) fd.append('meters_per_pixel', mppVal);
+
+        try {
+          const resp = await fetch('/infer', { method: 'POST', body: fd });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || 'Request failed');
+          statusDiv.textContent = 'Done.';
+          showMetricsFromResponse(data, 'upload');
+        } catch (err) {
+          statusDiv.innerHTML = '<span class="err">' + (err.message || String(err)) + '</span>';
+        }
+      });
+
+      // NAIP bbox form
+      document.getElementById('form-naip').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        metricsDiv.textContent = '';
+        resultImg.src = '';
+        statusDiv.textContent = 'Fetching NAIP and running detection...';
+
+        const min_lon = document.getElementById('min_lon').value;
+        const min_lat = document.getElementById('min_lat').value;
+        const max_lon = document.getElementById('max_lon').value;
+        const max_lat = document.getElementById('max_lat').value;
+        const width_px = document.getElementById('width_px').value || '1024';
+        const use_usgs = document.getElementById('use_usgs').value === 'true';
+        const conf = document.getElementById('conf2').value || '0.25';
+        const iou = document.getElementById('iou2').value || '0.5';
+
+        const fd = new FormData();
+        fd.append('min_lon', min_lon);
+        fd.append('min_lat', min_lat);
+        fd.append('max_lon', max_lon);
+        fd.append('max_lat', max_lat);
+        fd.append('width_px', width_px);
+        fd.append('use_usgs', String(use_usgs));
+        fd.append('conf', conf);
+        fd.append('iou', iou);
+
+        try {
+          const resp = await fetch('/infer_naip', { method: 'POST', body: fd });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || 'Request failed');
+          statusDiv.textContent = 'Done.';
+          showMetricsFromResponse(data, 'naip');
+        } catch (err) {
+          statusDiv.innerHTML = '<span class="err">' + (err.message || String(err)) + '</span>';
+        }
+      });
+    </script>
+  </body>
+</html>
