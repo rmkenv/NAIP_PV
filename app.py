@@ -2,8 +2,9 @@
 # hyperspectral_app.py
 # A full FastAPI service that preserves the NAIP NIR band, computes
 # NDVI / NDBI / Solar-Panel Spectral Index (SPSI), filters vegetation
-# false-positives, and offers an optional multi-channel feature stack
-# ready for custom 4-channel (RGB+NIR) or 7-channel YOLO training.
+# false-positives, offers optional sharpening, test-time augmentation (TTA),
+# and an optional multi-channel feature stack ready for custom 4-channel
+# (RGB+NIR) or 7-channel YOLO training.
 # =======================================================================
 
 import base64
@@ -176,9 +177,68 @@ def filter_vegetation_false_positives(polygons, boxes, ndvi, threshold=0.3):
             keep_boxes.append(box)
     return keep_polys, np.array(keep_boxes) if keep_boxes else None
 
-# ───────────────────────────────
-# 5. Core Inference Routine
-# ───────────────────────────────
+def sharpen_image_rgb(img_rgb: np.ndarray) -> np.ndarray:
+    """Apply sharpening to RGB image using a kernel."""
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5,-1],
+                       [0, -1, 0]])
+    sharp = cv2.filter2D(img_rgb, -1, kernel)
+    return sharp
+
+def yolo_infer_with_tta(model, img_rgb: np.ndarray, conf=0.25, iou=0.5, imgsz=1280):
+    """
+    Perform YOLO inference with test-time augmentation (TTA).
+    Returns combined polygon masks, boxes, confs.
+    """
+    augmentations = [lambda x: x,
+                     lambda x: cv2.flip(x, 1),  # horizontal flip
+                     lambda x: cv2.flip(x, 0)]  # vertical flip
+
+    all_polygons = []
+    all_boxes = []
+    all_confs = []
+
+    for aug in augmentations:
+        aug_img = aug(img_rgb)
+        results = model(aug_img, conf=conf, iou=iou, imgsz=imgsz, verbose=False)
+        r = results[0]
+
+        # Reverse augmentation on output boxes and polygons
+        if r.boxes is not None and r.boxes.xyxy is not None:
+            boxes = r.boxes.xyxy.cpu().numpy()
+            confs = r.boxes.conf.cpu().numpy() if r.boxes.conf is not None else None
+            # Flip boxes back if needed
+            if aug == augmentations[1]:  # horizontal flip
+                boxes[:, [0, 2]] = img_rgb.shape[1] - boxes[:, [2, 0]]
+            elif aug == augmentations[2]:  # vertical flip
+                boxes[:, [1, 3]] = img_rgb.shape[0] - boxes[:, [3, 1]]
+        else:
+            boxes, confs = None, None
+
+        polygons = []
+        if r.masks is not None and hasattr(r.masks, "xy"):
+            for poly in r.masks.xy:
+                p = np.array(poly)
+                # Flip polygons back
+                if aug == augmentations[1]:
+                    p[:, 0] = img_rgb.shape[1] - p[:, 0]
+                elif aug == augmentations[2]:
+                    p[:, 1] = img_rgb.shape[0] - p[:, 1]
+                polygons.append(p)
+        all_polygons.extend(polygons)
+        if boxes is not None:
+            all_boxes.extend(boxes)
+        if confs is not None:
+            all_confs.extend(confs)
+
+    # Optionally, apply Non-Max Suppression or merge results here
+    # For simplicity, returning concatenated detections
+    all_boxes = np.array(all_boxes) if all_boxes else None
+    all_confs = np.array(all_confs) if all_confs else None
+
+    return all_polygons, all_boxes, all_confs
+
+
 def yolo_infer_rgb(img_bgr: np.ndarray, conf=0.25, iou=0.5, imgsz=1280):
     """Run YOLO on RGB image and return result object."""
     results = MODEL(img_bgr[:, :, :3], conf=conf, iou=iou, imgsz=imgsz, verbose=False)
@@ -210,44 +270,51 @@ async def infer(
     iou: float = Form(0.5),
     imgsz: int = Form(1280),
     ndvi_threshold: float = Form(0.3),          # vegetation filter
+    sharpen: bool = Form(False),
+    augment: bool = Form(False),
 ):
     """
     Generic image inference (PNG/JPG/TIFF). If 4-band image is supplied,
     NDVI vegetation filter is applied to suppress false positives.
+    Supports optional sharpening and test-time augmentation.
     """
     try:
         img_bytes = await file.read()
         img = numpy_from_upload_multispectral(img_bytes)
 
-        # 4-band → compute NDVI for FP filtering
+        # Compute NDVI for false positive filtering if possible
         ndvi = compute_spectral_indices(img)["ndvi"] if img.shape[2] >= 4 else None
 
-        # NOTE: model still runs on RGB (first 3 channels)
-        result = yolo_infer_rgb(img, conf, iou, imgsz)
+        # Prepare RGB image for inference
+        img_rgb = img[:, :, :3]
+        if sharpen:
+            img_rgb = sharpen_image_rgb(img_rgb)
 
-        polygons = polygons_from_masks(result)
-        boxes    = result.boxes.xyxy.cpu().numpy() if result.boxes.xyxy is not None else None
-        confs    = result.boxes.conf.cpu().numpy() if result.boxes.conf is not None else None
+        if augment:
+            polygons, boxes, confs = yolo_infer_with_tta(MODEL, img_rgb, conf, iou, imgsz)
+        else:
+            result = MODEL(img_rgb, conf=conf, iou=iou, imgsz=imgsz, verbose=False)[0]
+            polygons = polygons_from_masks(result)
+            boxes = result.boxes.xyxy.cpu().numpy() if result.boxes.xyxy is not None else None
+            confs = result.boxes.conf.cpu().numpy() if result.boxes.conf is not None else None
 
-        # Vegetation filter
+        # Filter detections in high NDVI areas (vegetation false positives)
         if ndvi is not None and boxes is not None:
-            polygons, boxes = filter_vegetation_false_positives(
-                polygons, boxes, ndvi, threshold=ndvi_threshold
-            )
+            polygons, boxes = filter_vegetation_false_positives(polygons, boxes, ndvi, threshold=ndvi_threshold)
             if boxes is None or len(boxes) == 0:
                 polygons, boxes, confs = [], None, None
 
-        vis   = draw_detections(img[:, :, :3], polygons, boxes, confs)
-        png   = encode_png(vis)
-        b64   = base64.b64encode(png).decode()
+        vis = draw_detections(img_rgb, polygons, boxes, confs)
+        png = encode_png(vis)
+        b64 = base64.b64encode(png).decode()
         count = sum(1 for p in polygons if p is not None)
 
-        return JSONResponse(
-            {
-                "count": count,
-                "image_data_url": f"data:image/png;base64,{b64}",
-            }
-        )
+        return JSONResponse({
+            "count": count,
+            "image_data_url": f"data:image/png;base64,{b64}",
+            "used_sharpen": sharpen,
+            "used_augment": augment,
+        })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
