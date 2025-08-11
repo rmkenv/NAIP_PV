@@ -1,90 +1,82 @@
-<!-- Solar Panel Detector Frontend: Map-based UI with hybrid basemap and detection table -->
-
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Solar Panel Detector</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
 <style>
+  /* (Same CSS as previous with minor control and visualization settings) */
   #map { height: 520px; margin: 10px 0; }
-  .controls { display: flex; gap: 10px; flex-wrap: wrap; margin: 8px 0; align-items: center; }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; align-items: center; }
   .controls label { font-size: 14px; }
-  .hint { color:#444; font-size: 13px; margin-top: 4px; }
-  .row { display:flex; gap: 14px; align-items: center; flex-wrap: wrap; }
-  #result_panel { display: grid; grid-template-columns: 360px 1fr; gap: 10px; align-items: start; }
+  .hint { color: #444; font-size: 13px; margin-bottom: 8px; }
+  #result_panel { display: grid; grid-template-columns: 360px 1fr; gap: 10px; }
   #result_panel > div { overflow: auto; }
-  #result_panel > div:first-child img { max-width: 100%; border: 1px solid #ddd; border-radius: 6px; display: none; }
+  #result_panel > div:nth-child(1) img { max-width: 100%; border: 1px solid #ddd; border-radius: 6px; display: none;}
   #result_panel > div:nth-child(2) { height: 520px; }
-  #result_panel #result_map { height: 100%; width: 100%; display: none; }
-  .badge { display:inline-block; padding:2px 6px; border-radius:10px; background:#eef; color:#334; font-size:12px; margin-left:6px; }
-  #detections_table_container { margin-top: 10px; max-height: 200px; overflow-y: auto; }
-  #detections_table { border-collapse: collapse; width: 100%; font-size: 13px; }
-  #detections_table th, #detections_table td {
-    border: 1px solid #ccc;
-    padding: 4px 8px;
-    text-align: center;
-  }
-  #detections_table th {
-    background-color: #f0f0f0;
-  }
+  #result_panel #result_map { width: 100%; height: 100%; display: none; }
+  .badge { background-color: #eef; border-radius: 14px; padding: 2px 6px; margin-left: 6px; font-size: 12px; color: #334; }
+  #detections_table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  #detections_table th, #detections_table td { border: 1px solid #ccc; padding: 4px 8px; text-align: center; }
+  #detections_table th { background-color: #f0f0f0; }
+  #detections_table_container { margin-top: 10px; max-height: 180px; overflow-y: auto; display: none; }
 </style>
+</head>
+<body>
 
-<div>
-  <h3>Draw a box anywhere in the U.S. to fetch imagery and detect solar panels</h3>
+<h3>Solar Panel Detector: Draw a box (max 100 km²) and detect solar panels</h3>
 
-  <div id="map"></div>
+<div id="map"></div>
 
-  <div class="controls">
-    <div class="row">
-      <label>Basemap:
-        <select id="basemap">
-          <option value="hybrid" selected>ESRI World Imagery Hybrid</option>
-          <option value="osm">OpenStreetMap</option>
-        </select>
-      </label>
-      <label>Source:
-        <select id="use_source">
-          <option value="naip" selected>NAIP</option>
-          <option value="md">Maryland Six-Inch</option>
-          <option value="usda">USDA</option>
-        </select>
-      </label>
-      <label>Export width_px:
-        <input id="width_px" type="number" value="2048" min="512" max="3500" />
-      </label>
-      <label>imgsz:
-        <input id="imgsz" type="number" value="1536" min="640" max="2048" step="32" />
-      </label>
-      <label>conf:
-        <input id="conf" type="number" value="0.15" min="0" max="1" step="0.01" />
-      </label>
-      <label>iou:
-        <input id="iou" type="number" value="0.45" min="0" max="1" step="0.05" />
-      </label>
-      <label><input id="augment" type="checkbox" /> Augment (TTA)</label>
-      <label><input id="sharpen" type="checkbox" /> Sharpen</label>
-      <button id="preset_high_recall" type="button">High Recall</button>
-      <button id="run_btn" disabled>Run Detection</button>
-    </div>
-    <div class="hint">
-      Hint: Draw areas ~0.5 to 100 km² to maintain detail. <span class="badge">Tiling enabled</span>
-    </div>
+<div class="controls">
+  <label>Basemap:
+    <select id="basemap">
+      <option value="hybrid" selected>ESRI Hybrid</option>
+      <option value="osm">OpenStreetMap</option>
+    </select>
+  </label>
+  <label>Imagery source:
+    <select id="use_source">
+      <option value="naip" selected>NAIP</option>
+      <option value="md">Maryland Six Inch</option>
+      <option value="usda">USDA</option>
+    </select>
+  </label>
+  <label>Width (px):
+    <input type="number" id="width_px" value="2048" min="256" max="3500" />
+  </label>
+  <label>Image Size:
+    <input type="number" id="imgsz" value="1536" min="640" max="2048" step="32" />
+  </label>
+  <label>Confidence:
+    <input type="number" id="conf" step="0.01" min="0" max="1" value="0.15" />
+  </label>
+  <label>IoU:
+    <input type="number" id="iou" step="0.05" min="0" max="1" value="0.45" />
+  </label>
+  <label><input type="checkbox" id="augment" /> Augment (TTA)</label>
+  <label><input type="checkbox" id="sharpen" /> Sharpen</label>
+  <button id="preset_high_recall">High Recall</button>
+  <button id="run_btn" disabled>Run Detection</button>
+</div>
+
+<div id="status" class="hint"></div>
+
+<div id="result_panel">
+  <div>
+    <img id="result_img" alt="Detection Result" />
   </div>
-
-  <div id="status" class="hint"></div>
-
-  <div id="result_panel">
-    <div>
-      <img id="result_img" alt="Detection result" />
-    </div>
-    <div>
-      <div id="result_map"></div>
-      <div id="detections_table_container" style="display:none;">
-        <h4>Detections</h4>
-        <table id="detections_table" border="1">
-          <thead>
-            <tr><th>#</th><th>Confidence</th><th>Latitude</th><th>Longitude</th></tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
+  <div>
+    <div id="result_map"></div>
+    <div id="detections_table_container">
+      <h4>Detections</h4>
+      <table id="detections_table">
+        <thead>
+          <tr><th>#</th><th>Confidence</th><th>Latitude</th><th>Longitude</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
     </div>
   </div>
 </div>
@@ -92,96 +84,115 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
 <script>
-  // Initialize base layers
-  const usaCenter = [39.5, -98.35];
-  const map = L.map('map', { zoomControl: true }).setView(usaCenter, 4);
+  // Map Setup
+  const map = L.map('map').setView([39.5, -98.35], 4);
 
-  const esriImagery = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-    attribution: 'Tiles &copy; Esri & contributors'
+  // Layers
+  const esriImagery = L.tileLayer('https://server.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    attribution: 'Tiles © Esri'
   });
 
-  const esriLabels = L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
-    attribution: 'Labels &copy; Esri'
+  const esriLabels = L.tileLayer('https://services.arcgisonline.com/arcgis/rest/services/Reference/World_Labels/MapServer/tile/{z}/{y}/{x}', {
+    attribution: 'Labels © Esri'
   });
 
   const hybrid = L.layerGroup([esriImagery, esriLabels]);
   const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution: '&copy; OpenStreetMap',
-    maxZoom: 19
+    maxZoom: 19,
+    attribution: '© OpenStreetMap'
   });
 
-  // Maryland polygon approximate bounds (simplified rectangle)
+  hybrid.addTo(map);
+
+  // Maryland coverage polygon (approximate)
   const mdBounds = [[37.9, -79.5], [39.8, -75.0]];
-  const mdPolygon = L.rectangle(mdBounds, {
+  const mdCoverage = L.rectangle(mdBounds, {
     color: 'blue',
     weight: 2,
     fillOpacity: 0.15,
     dashArray: '4'
-  }).bindTooltip("Maryland Six-Inch Imagery Coverage").addTo(map);
+  }).addTo(map).bindTooltip("Maryland Six Inch Imagery Coverage");
 
-  // Add the hybrid basemap + md coverage polygon by default
-  hybrid.addTo(map);
-
-  // Handle basemap switching, maintaining mdPolygon overlay
-  document.getElementById('basemap').addEventListener('change', e => {
-    const val = e.target.value;
-    map.eachLayer(layer => map.removeLayer(layer));
-    mdPolygon.addTo(map);
-    if (val === 'osm') {
-      osm.addTo(map);
-    } else {
+  // Layers control state
+  function setBaseLayer(layerName) {
+    map.eachLayer(layer => {
+      if(layer !== mdCoverage && !layer._controlPos){ // Keep coverage polygon
+        map.removeLayer(layer);
+      }
+    });
+    if (layerName === 'hybrid') {
       hybrid.addTo(map);
+    } else {
+      osm.addTo(map);
     }
+  }
+
+  document.getElementById('basemap').addEventListener('change', e => {
+    setBaseLayer(e.target.value);
   });
 
-  // Draw controls setup
+  // Drawing controls
   const drawnItems = new L.FeatureGroup();
   map.addLayer(drawnItems);
+
   const drawControl = new L.Control.Draw({
     draw: {
-      rectangle: { shapeOptions: { color: '#f97316', weight: 2 } },
-      polygon: false, polyline: false, circle: false, marker: false, circlemarker: false
+      polygon: false,
+      polyline: false,
+      circle: false,
+      marker: false,
+      circlemarker: false,
+      rectangle: {
+        shapeOptions: { color: '#f97316', weight: 2 }
+      }
     },
-    edit: { featureGroup: drawnItems, edit: true, remove: true }
+    edit: {
+      featureGroup: drawnItems,
+      edit: true,
+      remove: true
+    }
   });
   map.addControl(drawControl);
 
-  // Area constraint computation in km²
-  function bboxAreaKm2(bounds) {
-    const toRad = d => d * Math.PI / 180;
-    const lat1 = bounds.getSouth(), lat2 = bounds.getNorth(),
-          lon1 = bounds.getWest(), lon2 = bounds.getEast();
-    const latRad = toRad((lat1 + lat2) / 2);
-    const mPerDegLat = 111132.92 - 559.82 * Math.cos(2 * latRad) + 1.175 * Math.cos(4 * latRad) - 0.0023 * Math.cos(6 * latRad);
-    const mPerDegLon = 111412.84 * Math.cos(latRad) - 93.5 * Math.cos(3 * latRad) + 0.118 * Math.cos(5 * latRad);
-    const width = Math.abs(lon2 - lon1) * mPerDegLon;
-    const height = Math.abs(lat2 - lat1) * mPerDegLat;
-    return (width * height) / 1e6;
+  // Bounding box constraints and Maryland coverage check
+  function calculateBBoxAreaKm2(bounds){
+    const rad = deg => deg * (Math.PI / 180);
+    const lat1 = bounds.getSouth(), lat2 = bounds.getNorth();
+    const lon1 = bounds.getWest(), lon2 = bounds.getEast();
+    const latRad = rad((lat1 + lat2)/2);
+    const mPerLat = 111132.92 - 559.82 * Math.cos(2*latRad) + 1.175*Math.cos(4*latRad) - 0.0023*Math.cos(6*latRad);
+    const mPerLon = 111412.84 * Math.cos(latRad) - 93.5*Math.cos(3*latRad) + 0.118*Math.cos(5*latRad);
+    const width_m = Math.abs(lon2 - lon1)*mPerLon;
+    const height_m = Math.abs(lat2 - lat1)*mPerLat;
+    return (width_m*height_m)/1e6;
   }
 
-  // Validate bounding box, including Maryland coverage if MD imagery source selected
-  function validateRect(layer) {
+  function isBoundingBoxWithinMD(bounds) {
+    const mdLatLngBounds = L.latLngBounds(mdBounds);
+    return mdLatLngBounds.intersects(bounds);
+  }
+
+  let lastRect = null;
+
+  function validateDrawnBox(layer) {
+    if(!layer) return false;
     const bounds = layer.getBounds();
-    const area = bboxAreaKm2(bounds);
+    const area = calculateBBoxAreaKm2(bounds);
     if (area < 0.5 || area > 100) {
-      alert(`Selected area is ${area.toFixed(2)} km². Please select between 0.5 and 100 km².`);
+      alert(`Selected area is ${area.toFixed(2)} km². Must be between 0.5 and 100 km².`);
       return false;
     }
-    const source = document.getElementById('use_source').value;
-    if (source === 'md') {
-      const mdBoundsLatLng = L.latLngBounds(mdBounds);
-      if (!mdBoundsLatLng.intersects(bounds)) {
-        alert("Selected area is outside Maryland Six-Inch imagery coverage.");
+    if(document.getElementById('use_source').value === 'md') {
+      if(!isBoundingBoxWithinMD(bounds)) {
+        alert("Selected area is outside Maryland Six Inch imagery coverage.");
         return false;
       }
     }
     return true;
   }
 
-  let lastRect = null;
-
   map.on('draw:created', e => {
-    if (!validateRect(e.layer)) return;
+    if(!validateDrawnBox(e.layer)) return;
     drawnItems.clearLayers();
     lastRect = e.layer;
     drawnItems.addLayer(lastRect);
@@ -189,17 +200,22 @@
   });
 
   map.on('draw:edited', e => {
-    const layers = drawnItems.getLayers();
-    if (layers.length && validateRect(layers[0])) lastRect = layers[0];
+    const layers = e.layers.getLayers();
+    if(layers.length && validateDrawnBox(layers[0])) {
+      lastRect = layers[0];
+    } else {
+      document.getElementById('run_btn').disabled = true;
+    }
   });
 
   map.on('draw:deleted', e => {
+    drawnItems.clearLayers();
     lastRect = null;
     document.getElementById('run_btn').disabled = true;
   });
 
-  // Send detection inference request
-  async function postInfer(bounds, params) {
+  // Inference request
+  async function runInference(bounds, params) {
     const fd = new FormData();
     fd.append('min_lon', bounds.getWest());
     fd.append('min_lat', bounds.getSouth());
@@ -212,52 +228,60 @@
     fd.append('imgsz', params.imgsz);
     fd.append('augment', params.augment);
     fd.append('sharpen', params.sharpen);
+
     const resp = await fetch('/infer_imagery', { method: 'POST', body: fd });
     if (!resp.ok) throw new Error(await resp.text());
-    return resp.json();
+    return await resp.json();
   }
 
-  // Show results as image overlay and interactive map
-  function showDetectionMap(data, bounds) {
+  // Show detection overlays on map
+  function showDetectionsOnMap(data, bounds) {
     const mapDiv = document.getElementById('result_map');
     mapDiv.style.display = 'block';
-    if (window.resultMap) window.resultMap.remove();
+    if(window.resultMap) window.resultMap.remove();
+
     window.resultMap = L.map('result_map', { zoomControl: true, attributionControl: false });
+
     const imageBounds = L.latLngBounds(bounds.getSouthWest(), bounds.getNorthEast());
 
-    // Hybrid base layers for result map
-    const imagery = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-      attribution: 'Tiles &copy; Esri & contributors'
+    const imagery = L.tileLayer('https://server.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      attribution: 'Tiles © Esri'
     });
-    const labels = L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
-      attribution: 'Labels &copy; Esri'
+    const labels = L.tileLayer('https://services.arcgisonline.com/arcgis/rest/services/Reference/World_Labels/MapServer/tile/{z}/{y}/{x}', {
+      attribution: 'Labels © Esri'
     });
 
-    L.layerGroup([imagery, labels]).addTo(window.resultMap);
+    imagery.addTo(window.resultMap);
+    labels.addTo(window.resultMap);
 
+    // Image overlay with detection results
     L.imageOverlay(data.image_data_url, imageBounds).addTo(window.resultMap);
-
     window.resultMap.fitBounds(imageBounds);
   }
 
-  // Populate detections table with confidence and location
+  // Populate detections table
   function populateDetectionsTable(detections) {
     const container = document.getElementById('detections_table_container');
     const tbody = document.querySelector('#detections_table tbody');
     tbody.innerHTML = '';
-    if (!detections || !detections.length) {
+    if(!detections || detections.length === 0) {
       container.style.display = 'none';
       return;
     }
     container.style.display = 'block';
     detections.forEach((det, i) => {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${i + 1}</td><td>${(det.score * 100).toFixed(1)}%</td><td>${det.lat.toFixed(6)}</td><td>${det.lon.toFixed(6)}</td>`;
+      tr.innerHTML = `
+        <td>${i + 1}</td>
+        <td>${(det.score * 100).toFixed(1)}%</td>
+        <td>${det.lat.toFixed(6)}</td>
+        <td>${det.lon.toFixed(6)}</td>
+      `.trim();
       tbody.appendChild(tr);
     });
   }
 
-  // Preset button to fill high recall settings
+  // Preset button fills recommended parameters for high recall
   document.getElementById('preset_high_recall').addEventListener('click', () => {
     document.getElementById('width_px').value = 2048;
     document.getElementById('imgsz').value = 1536;
@@ -267,14 +291,14 @@
     document.getElementById('sharpen').checked = true;
   });
 
-  // Run detection when user clicks button
+  // Run detection button event
   document.getElementById('run_btn').addEventListener('click', async () => {
     const status = document.getElementById('status');
     const imgEl = document.getElementById('result_img');
     const mapEl = document.getElementById('result_map');
 
-    if (!lastRect) {
-      alert("Please draw a bounding box first.");
+    if(!lastRect) {
+      alert("Please draw a bounding box before running detection.");
       return;
     }
 
@@ -286,7 +310,7 @@
       iou: Number(document.getElementById('iou').value),
       imgsz: Number(document.getElementById('imgsz').value),
       augment: document.getElementById('augment').checked,
-      sharpen: document.getElementById('sharpen').checked
+      sharpen: document.getElementById('sharpen').checked,
     };
 
     status.textContent = 'Fetching imagery and running detection...';
@@ -296,23 +320,22 @@
     populateDetectionsTable([]);
 
     try {
-      const data = await postInfer(bounds, params);
-
-      if (data.error) throw new Error(data.error);
+      const data = await runInference(bounds, params);
+      if(data.error) throw new Error(data.error);
 
       imgEl.src = data.image_data_url;
       imgEl.style.display = 'block';
 
-      showDetectionMap(data, bounds);
+      showDetectionsOnMap(data, bounds);
 
-      status.textContent = `Detected ${data.count} panels | Area: approx. ${data.area_m2 ? data.area_m2.toFixed(1) + ' m²' : 'N/A'} | ` +
-                           `Resolution: ${data.mpp_x ? data.mpp_x.toFixed(3) : '?'}m x ${data.mpp_y ? data.mpp_y.toFixed(3) : '?'}m | ` +
-                           `Augment: ${params.augment} | Sharpen: ${params.sharpen} | Source: ${data.imagery_source}`;
+      status.textContent = `Detected ${data.count} panels | Area: ${
+        data.area ? data.area + ' m²' : 'N/A'
+      } | Resolution: ${data.mpp_x ? data.mpp_x.toFixed(3) : '?'}m x ${data.mpp_y ? data.mpp_y.toFixed(3) : '?'}m | Augment: ${params.augment} | Sharpen: ${params.sharpen} | Source: ${data.imagery_source}`;
 
       populateDetectionsTable(data.detections);
-    } catch (e) {
-      status.textContent = 'Error: ' + e.message;
-      console.error(e);
+    } catch (err) {
+      status.textContent = 'Error: ' + err.message;
+      console.error(err);
     }
   });
 </script>
