@@ -265,7 +265,7 @@ def index():
 
 @app.post("/infer_imagery")
 async def infer_imagery(
-    service: str = Form("naip"),  # "naip" or "md"
+    use_source: str = Form("naip"),  # Align parameter name with frontend
     min_lon: float = Form(...),
     min_lat: float = Form(...),
     max_lon: float = Form(...),
@@ -280,7 +280,7 @@ async def infer_imagery(
 ):
     try:
         xmin, ymin, xmax, ymax = bbox4326_to_3857(min_lon, min_lat, max_lon, max_lat)
-        if service == "md":
+        if use_source == "md":
             img, mpp_x, mpp_y = fetch_md_sixinch_bbox_mercator(xmin, ymin, xmax, ymax, width_px)
             imagery_source = "Maryland Six Inch"
         else:
@@ -304,7 +304,7 @@ async def infer_imagery(
         vis = draw_detections(img_rgb, polygons, boxes, confs)
         png = encode_png(vis)
         b64 = base64.b64encode(png).decode()
-        # Add detection list
+        # Add detection list with lat/lon and score
         detection_rows = []
         if boxes is not None and confs is not None:
             for i, box in enumerate(boxes):
@@ -340,4 +340,5 @@ async def extract_features(file: UploadFile = File(...)):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-# Usage: uvicorn hyperspectral_app_sp_pi:app --reload
+# Usage:
+# Run with: uvicorn hyperspectral_app_sp_pi:app --reload
