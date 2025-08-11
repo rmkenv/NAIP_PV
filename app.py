@@ -340,5 +340,4 @@ async def extract_features(file: UploadFile = File(...)):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-# Usage:
-# Run with: uvicorn hyperspectral_app_sp_pi:app --reload
+
