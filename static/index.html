@@ -110,10 +110,7 @@
     maxZoom: 19
   });
 
-  // Add the hybrid base by default
-  hybrid.addTo(map);
-
-  // Maryland polygon approximate bounds (simplistic rectangle for demo)
+  // Maryland polygon approximate bounds (simplified rectangle)
   const mdBounds = [[37.9, -79.5], [39.8, -75.0]];
   const mdPolygon = L.rectangle(mdBounds, {
     color: 'blue',
@@ -122,7 +119,10 @@
     dashArray: '4'
   }).bindTooltip("Maryland Six-Inch Imagery Coverage").addTo(map);
 
-  // Basemap control
+  // Add the hybrid basemap + md coverage polygon by default
+  hybrid.addTo(map);
+
+  // Handle basemap switching, maintaining mdPolygon overlay
   document.getElementById('basemap').addEventListener('change', e => {
     const val = e.target.value;
     map.eachLayer(layer => map.removeLayer(layer));
@@ -134,23 +134,19 @@
     }
   });
 
-  // Draw controls
+  // Draw controls setup
   const drawnItems = new L.FeatureGroup();
   map.addLayer(drawnItems);
   const drawControl = new L.Control.Draw({
     draw: {
       rectangle: { shapeOptions: { color: '#f97316', weight: 2 } },
-      polygon: false,
-      polyline: false,
-      circle: false,
-      marker: false,
-      circlemarker: false
+      polygon: false, polyline: false, circle: false, marker: false, circlemarker: false
     },
     edit: { featureGroup: drawnItems, edit: true, remove: true }
   });
   map.addControl(drawControl);
 
-  // Bounding box area constraint (0.5 to 100 km²)
+  // Area constraint computation in km²
   function bboxAreaKm2(bounds) {
     const toRad = d => d * Math.PI / 180;
     const lat1 = bounds.getSouth(), lat2 = bounds.getNorth(),
@@ -163,7 +159,7 @@
     return (width * height) / 1e6;
   }
 
-  // Validate rectangle against size constraints and Maryland coverage if MD selected
+  // Validate bounding box, including Maryland coverage if MD imagery source selected
   function validateRect(layer) {
     const bounds = layer.getBounds();
     const area = bboxAreaKm2(bounds);
@@ -171,7 +167,6 @@
       alert(`Selected area is ${area.toFixed(2)} km². Please select between 0.5 and 100 km².`);
       return false;
     }
-    // If source is Maryland, check rectangle intersects mdPolygon bounds
     const source = document.getElementById('use_source').value;
     if (source === 'md') {
       const mdBoundsLatLng = L.latLngBounds(mdBounds);
@@ -203,7 +198,7 @@
     document.getElementById('run_btn').disabled = true;
   });
 
-  // Send detection request
+  // Send detection inference request
   async function postInfer(bounds, params) {
     const fd = new FormData();
     fd.append('min_lon', bounds.getWest());
@@ -222,7 +217,7 @@
     return resp.json();
   }
 
-  // Display results on map with overlay
+  // Show results as image overlay and interactive map
   function showDetectionMap(data, bounds) {
     const mapDiv = document.getElementById('result_map');
     mapDiv.style.display = 'block';
@@ -230,7 +225,7 @@
     window.resultMap = L.map('result_map', { zoomControl: true, attributionControl: false });
     const imageBounds = L.latLngBounds(bounds.getSouthWest(), bounds.getNorthEast());
 
-    // Hybrid layers for result
+    // Hybrid base layers for result map
     const imagery = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
       attribution: 'Tiles &copy; Esri & contributors'
     });
@@ -240,12 +235,12 @@
 
     L.layerGroup([imagery, labels]).addTo(window.resultMap);
 
-    L.imageOverlay(data.image_url || data.image_data_url, imageBounds).addTo(window.resultMap);
+    L.imageOverlay(data.image_data_url, imageBounds).addTo(window.resultMap);
 
     window.resultMap.fitBounds(imageBounds);
   }
 
-  // Populate table of detections
+  // Populate detections table with confidence and location
   function populateDetectionsTable(detections) {
     const container = document.getElementById('detections_table_container');
     const tbody = document.querySelector('#detections_table tbody');
@@ -262,11 +257,62 @@
     });
   }
 
-  // Preset button for high recall
+  // Preset button to fill high recall settings
   document.getElementById('preset_high_recall').addEventListener('click', () => {
     document.getElementById('width_px').value = 2048;
     document.getElementById('imgsz').value = 1536;
     document.getElementById('conf').value = 0.15;
     document.getElementById('iou').value = 0.45;
     document.getElementById('augment').checked = true;
-    document
+    document.getElementById('sharpen').checked = true;
+  });
+
+  // Run detection when user clicks button
+  document.getElementById('run_btn').addEventListener('click', async () => {
+    const status = document.getElementById('status');
+    const imgEl = document.getElementById('result_img');
+    const mapEl = document.getElementById('result_map');
+
+    if (!lastRect) {
+      alert("Please draw a bounding box first.");
+      return;
+    }
+
+    const bounds = lastRect.getBounds();
+    const params = {
+      width_px: Number(document.getElementById('width_px').value),
+      use_source: document.getElementById('use_source').value,
+      conf: Number(document.getElementById('conf').value),
+      iou: Number(document.getElementById('iou').value),
+      imgsz: Number(document.getElementById('imgsz').value),
+      augment: document.getElementById('augment').checked,
+      sharpen: document.getElementById('sharpen').checked
+    };
+
+    status.textContent = 'Fetching imagery and running detection...';
+    imgEl.style.display = 'none';
+    mapEl.style.display = 'none';
+    mapEl.innerHTML = '';
+    populateDetectionsTable([]);
+
+    try {
+      const data = await postInfer(bounds, params);
+
+      if (data.error) throw new Error(data.error);
+
+      imgEl.src = data.image_data_url;
+      imgEl.style.display = 'block';
+
+      showDetectionMap(data, bounds);
+
+      status.textContent = `Detected ${data.count} panels | Area: approx. ${data.area_m2 ? data.area_m2.toFixed(1) + ' m²' : 'N/A'} | ` +
+                           `Resolution: ${data.mpp_x ? data.mpp_x.toFixed(3) : '?'}m x ${data.mpp_y ? data.mpp_y.toFixed(3) : '?'}m | ` +
+                           `Augment: ${params.augment} | Sharpen: ${params.sharpen} | Source: ${data.imagery_source}`;
+
+      populateDetectionsTable(data.detections);
+    } catch (e) {
+      status.textContent = 'Error: ' + e.message;
+      console.error(e);
+    }
+  });
+</script>
