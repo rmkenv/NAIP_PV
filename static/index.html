@@ -1,4 +1,4 @@
-<!-- Map-based NAIP and MD imagery inference UI with hybrid basemap, augment+sharpen options, and detection table -->
+<!-- Solar Panel Detector Frontend: Map-based UI with hybrid basemap and detection table -->
 
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
@@ -10,11 +10,11 @@
   .row { display:flex; gap: 14px; align-items: center; flex-wrap: wrap; }
   #result_panel { display: grid; grid-template-columns: 360px 1fr; gap: 10px; align-items: start; }
   #result_panel > div { overflow: auto; }
-  #result_panel > div:not(:first-child) { height: 520px; }
   #result_panel > div:first-child img { max-width: 100%; border: 1px solid #ddd; border-radius: 6px; display: none; }
+  #result_panel > div:nth-child(2) { height: 520px; }
   #result_panel #result_map { height: 100%; width: 100%; display: none; }
   .badge { display:inline-block; padding:2px 6px; border-radius:10px; background:#eef; color:#334; font-size:12px; margin-left:6px; }
-  #detections_table_container { margin: 8px 0 0 0; max-height: 200px; overflow-y: auto; }
+  #detections_table_container { margin-top: 10px; max-height: 200px; overflow-y: auto; }
   #detections_table { border-collapse: collapse; width: 100%; font-size: 13px; }
   #detections_table th, #detections_table td {
     border: 1px solid #ccc;
@@ -28,6 +28,7 @@
 
 <div>
   <h3>Draw a box anywhere in the U.S. to fetch imagery and detect solar panels</h3>
+
   <div id="map"></div>
 
   <div class="controls">
@@ -41,7 +42,7 @@
       <label>Source:
         <select id="use_source">
           <option value="naip" selected>NAIP</option>
-          <option value="md">Maryland 6-inch</option>
+          <option value="md">Maryland Six-Inch</option>
           <option value="usda">USDA</option>
         </select>
       </label>
@@ -91,94 +92,119 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
 <script>
-  // Initialize map and layers
+  // Initialize base layers
   const usaCenter = [39.5, -98.35];
-  const map = L.map('map', { zoomControl: true }).setView(usaCenter,4);
+  const map = L.map('map', { zoomControl: true }).setView(usaCenter, 4);
 
   const esriImagery = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
     attribution: 'Tiles &copy; Esri & contributors'
   });
 
-  const esriLabels = L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Labels/MapServer/tile/{z}/{y}/{x}', {
+  const esriLabels = L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
     attribution: 'Labels &copy; Esri'
   });
 
   const hybrid = L.layerGroup([esriImagery, esriLabels]);
   const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution: '&copy; OpenStreetMap contributors',
+    attribution: '&copy; OpenStreetMap',
     maxZoom: 19
   });
 
+  // Add the hybrid base by default
   hybrid.addTo(map);
 
+  // Maryland polygon approximate bounds (simplistic rectangle for demo)
+  const mdBounds = [[37.9, -79.5], [39.8, -75.0]];
+  const mdPolygon = L.rectangle(mdBounds, {
+    color: 'blue',
+    weight: 2,
+    fillOpacity: 0.15,
+    dashArray: '4'
+  }).bindTooltip("Maryland Six-Inch Imagery Coverage").addTo(map);
+
+  // Basemap control
   document.getElementById('basemap').addEventListener('change', e => {
     const val = e.target.value;
-    map.eachLayer(layer => map.removeLayer(layer))
-    if(val === 'osm'){
+    map.eachLayer(layer => map.removeLayer(layer));
+    mdPolygon.addTo(map);
+    if (val === 'osm') {
       osm.addTo(map);
-    }else{
+    } else {
       hybrid.addTo(map);
     }
   });
 
-  // Drawing tools setup
+  // Draw controls
   const drawnItems = new L.FeatureGroup();
   map.addLayer(drawnItems);
-
   const drawControl = new L.Control.Draw({
     draw: {
-      rectangle: {shapeOptions: {color: '#f97316', weight: 2}},
-      polygon:false, polyline:false, circle:false, marker:false, circlemarker:false
+      rectangle: { shapeOptions: { color: '#f97316', weight: 2 } },
+      polygon: false,
+      polyline: false,
+      circle: false,
+      marker: false,
+      circlemarker: false
     },
-    edit: {featureGroup: drawnItems, edit:true, remove:true}
+    edit: { featureGroup: drawnItems, edit: true, remove: true }
   });
   map.addControl(drawControl);
 
-  // Area Constraints
-  function bboxAreaKm2(bounds){
-    const toRad = d => d*Math.PI/180;
+  // Bounding box area constraint (0.5 to 100 km²)
+  function bboxAreaKm2(bounds) {
+    const toRad = d => d * Math.PI / 180;
     const lat1 = bounds.getSouth(), lat2 = bounds.getNorth(),
           lon1 = bounds.getWest(), lon2 = bounds.getEast();
-    const latMid = toRad((lat1+lat2)/2);
-    const mPerDegLat = 111132.92 - 559.82 * Math.cos(2*latMid) + 1.175*Math.cos(4*latMid) -0.0023*Math.cos(6*latMid);
-    const mPerDegLon = 111412.84 * Math.cos(latMid) - 93.5 * Math.cos(3*latMid) + 0.118 * Math.cos(5*latMid);
-    const width = Math.abs(lon2-lon1) * mPerDegLon;
+    const latRad = toRad((lat1 + lat2) / 2);
+    const mPerDegLat = 111132.92 - 559.82 * Math.cos(2 * latRad) + 1.175 * Math.cos(4 * latRad) - 0.0023 * Math.cos(6 * latRad);
+    const mPerDegLon = 111412.84 * Math.cos(latRad) - 93.5 * Math.cos(3 * latRad) + 0.118 * Math.cos(5 * latRad);
+    const width = Math.abs(lon2 - lon1) * mPerDegLon;
     const height = Math.abs(lat2 - lat1) * mPerDegLat;
-    return (width*height)/1e6;
+    return (width * height) / 1e6;
   }
 
-  function validateRect(layer){
-    const area = bboxAreaKm2(layer.getBounds());
-    if(area < 0.5 || area > 100){
-      alert('Selected area is '+area.toFixed(2)+' km². Please select between 0.5 and 100 km².');
+  // Validate rectangle against size constraints and Maryland coverage if MD selected
+  function validateRect(layer) {
+    const bounds = layer.getBounds();
+    const area = bboxAreaKm2(bounds);
+    if (area < 0.5 || area > 100) {
+      alert(`Selected area is ${area.toFixed(2)} km². Please select between 0.5 and 100 km².`);
       return false;
+    }
+    // If source is Maryland, check rectangle intersects mdPolygon bounds
+    const source = document.getElementById('use_source').value;
+    if (source === 'md') {
+      const mdBoundsLatLng = L.latLngBounds(mdBounds);
+      if (!mdBoundsLatLng.intersects(bounds)) {
+        alert("Selected area is outside Maryland Six-Inch imagery coverage.");
+        return false;
+      }
     }
     return true;
   }
 
   let lastRect = null;
 
-  map.on('draw:created', e=>{
-    if(!validateRect(e.layer))return;
+  map.on('draw:created', e => {
+    if (!validateRect(e.layer)) return;
     drawnItems.clearLayers();
     lastRect = e.layer;
     drawnItems.addLayer(lastRect);
     document.getElementById('run_btn').disabled = false;
   });
 
-  map.on('draw:edited', e=>{
+  map.on('draw:edited', e => {
     const layers = drawnItems.getLayers();
-    if(layers.length && validateRect(layers[0]))
-      lastRect = layers[0];
+    if (layers.length && validateRect(layers[0])) lastRect = layers[0];
   });
 
-  map.on('draw:deleted', e=>{
+  map.on('draw:deleted', e => {
     lastRect = null;
     document.getElementById('run_btn').disabled = true;
   });
 
-  // Post detection request
-  async function postInfer(bounds, params){
+  // Send detection request
+  async function postInfer(bounds, params) {
     const fd = new FormData();
     fd.append('min_lon', bounds.getWest());
     fd.append('min_lat', bounds.getSouth());
@@ -191,115 +217,56 @@
     fd.append('imgsz', params.imgsz);
     fd.append('augment', params.augment);
     fd.append('sharpen', params.sharpen);
-
-    const resp = await fetch('/infer_imagery', {method:'POST',body:fd});
-    if(!resp.ok)
-      throw new Error(await resp.text());
-    return await resp.json();
+    const resp = await fetch('/infer_imagery', { method: 'POST', body: fd });
+    if (!resp.ok) throw new Error(await resp.text());
+    return resp.json();
   }
 
-  // Show detected overlays
-  function showDetectionMap(data, bounds){
-    const resultMapDiv = document.getElementById('result_map');
-    resultMapDiv.style.display = 'block';
-
-    if(window.resultMap)
-      window.resultMap.remove();
-
-    window.resultMap = L.map('result_map', {zoomControl:true, attributionControl:false});
-
+  // Display results on map with overlay
+  function showDetectionMap(data, bounds) {
+    const mapDiv = document.getElementById('result_map');
+    mapDiv.style.display = 'block';
+    if (window.resultMap) window.resultMap.remove();
+    window.resultMap = L.map('result_map', { zoomControl: true, attributionControl: false });
     const imageBounds = L.latLngBounds(bounds.getSouthWest(), bounds.getNorthEast());
 
+    // Hybrid layers for result
     const imagery = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
       attribution: 'Tiles &copy; Esri & contributors'
     });
-
-    const labels = L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Labels/MapServer/tile/{z}/{y}/{x}', {
+    const labels = L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}', {
       attribution: 'Labels &copy; Esri'
     });
 
     L.layerGroup([imagery, labels]).addTo(window.resultMap);
 
-    L.imageOverlay(data.image_data_url, imageBounds).addTo(window.resultMap);
+    L.imageOverlay(data.image_url || data.image_data_url, imageBounds).addTo(window.resultMap);
 
     window.resultMap.fitBounds(imageBounds);
   }
 
-  // Populate detections table
-  function populateDetectionsTable(detections){
+  // Populate table of detections
+  function populateDetectionsTable(detections) {
     const container = document.getElementById('detections_table_container');
     const tbody = document.querySelector('#detections_table tbody');
     tbody.innerHTML = '';
-    if(!detections || detections.length === 0) {
+    if (!detections || !detections.length) {
       container.style.display = 'none';
       return;
     }
     container.style.display = 'block';
-    detections.forEach((det,i)=>{
+    detections.forEach((det, i) => {
       const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td>${i+1}</td>
-        <td>${(det.score*100).toFixed(1)}%</td>
-        <td>${det.lat.toFixed(6)}</td>
-        <td>${det.lon.toFixed(6)}</td>
-      `.trim();
+      tr.innerHTML = `<td>${i + 1}</td><td>${(det.score * 100).toFixed(1)}%</td><td>${det.lat.toFixed(6)}</td><td>${det.lon.toFixed(6)}</td>`;
       tbody.appendChild(tr);
     });
   }
 
-  // Preset controls for high recall
-  document.getElementById('preset_high_recall').addEventListener('click', ()=>{
+  // Preset button for high recall
+  document.getElementById('preset_high_recall').addEventListener('click', () => {
     document.getElementById('width_px').value = 2048;
     document.getElementById('imgsz').value = 1536;
     document.getElementById('conf').value = 0.15;
     document.getElementById('iou').value = 0.45;
     document.getElementById('augment').checked = true;
-    document.getElementById('sharpen').checked = true;
-  });
-
-  // Run detection button
-  document.getElementById('run_btn').addEventListener('click', async ()=>{
-    const status = document.getElementById('status');
-    const imgEl = document.getElementById('result_img');
-    const mapEl = document.getElementById('result_map');
-
-    if(!lastRect) return;
-
-    const bounds = lastRect.getBounds();
-    const params = {
-      width_px: Number(document.getElementById('width_px').value),
-      use_source: document.getElementById('use_source').value,
-      conf: Number(document.getElementById('conf').value),
-      iou: Number(document.getElementById('iou').value),
-      imgsz: Number(document.getElementById('imgsz').value),
-      augment: document.getElementById('augment').checked,
-      sharpen: document.getElementById('sharpen').checked,
-    };
-
-    status.textContent = 'Fetching imagery and running detection...';
-    imgEl.style.display = 'none';
-    mapEl.style.display = 'none';
-    mapEl.innerHTML = '';
-    populateDetectionsTable([]);
-
-    try {
-      const data = await postInfer(bounds, params);
-      if(data.error) throw new Error(data.error);
-
-      imgEl.src = data.image_data_url;
-      imgEl.style.display = 'block';
-
-      showDetectionMap(data, lastRect.getBounds());
-
-      status.textContent = `Detected ${data.count} panels | Area: approx. ${(data.total_area || 'N/A')} | `+
-                           `Resolution: ${data.mpp_x?.toFixed(3)}m x ${data.mpp_y?.toFixed(3)}m | `+
-                           `Augment: ${params.augment} | Sharpen: ${params.sharpen} | Source: ${data.imagery_source}`;
-
-      populateDetectionsTable(data.detections);
-
-    } catch(e){
-      status.textContent = 'Error: ' + e.message;
-      console.error(e);
-    }
-  });
-</script>
+    document
