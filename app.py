@@ -1,11 +1,9 @@
 # =======================================================================
 # hyperspectral_app_sp_pi.py
-# A full FastAPI service that preserves the NAIP NIR band, computes
-# NDVI / NDBI / Solar-Panel Spectral Index (SPSI) and Solar Photovoltaic
-# Panel Index (SPPI) from the recent research, filters vegetation
-# false-positives, offers optional sharpening, test-time augmentation (TTA),
-# and an optional multi-channel feature stack ready for custom multispectral
-# YOLO training including SPPI.
+# A FastAPI service for solar panel detection with NAIP (default) or
+# Maryland Six Inch high-res aerial imagery. Preserves multispectral bands,
+# computes NDVI/NDBI/SPSI/SPPI indices, optional sharpening and TTA,
+# and supports high-resolution image inference and training feature extraction.
 # =======================================================================
 
 import base64
@@ -23,10 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from huggingface_hub import hf_hub_download
 from ultralytics import YOLO
 
-# ───────────────────────────────
-# 1. FastAPI & CORS Boilerplate
-# ───────────────────────────────
-app = FastAPI(title="Hyperspectral Solar-Panel Detector with SPPI")
+app = FastAPI(title="Hyperspectral Solar-Panel Detector with SPPI and High-Res MD")
 
 if not os.path.exists("static"):
     os.makedirs("static", exist_ok=True)
@@ -39,95 +34,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ───────────────────────────────
-# 2. YOLO Model
-# ───────────────────────────────
 def download_model() -> str:
-    repo_id = "finloop/yolov8s-seg-solar-panels"  # RGB-trained weights
+    repo_id = "finloop/yolov8s-seg-solar-panels"
     model_path = hf_hub_download(repo_id, filename="best.pt")
     return model_path
 
 MODEL_PATH = download_model()
-MODEL = YOLO(MODEL_PATH)  # expects 3-channel RGB
+MODEL = YOLO(MODEL_PATH)
 
-# ───────────────────────────────
-# 3. Spectral Utilities & Indices
-# ───────────────────────────────
-
-# Color constants (BGR)
+# Utility Constants
 PANEL_COLOR = (60, 220, 60)
 BOX_COLOR = (40, 180, 255)
 TEXT_COLOR = (255, 255, 255)
+R_MAJOR = 6378137.0  # For Mercator projection
 
+# ------------ Multispectral Band Processing -----------------
 def numpy_from_upload_multispectral(file_bytes: bytes) -> np.ndarray:
-    """
-    Keep all bands (e.g. NAIP 4-band RGB+NIR). If more than 4 bands are
-    present, cut to first 4; YOLO uses RGB, but spectral indices still
-    exploit NIR.
-    """
     arr = np.frombuffer(file_bytes, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise ValueError("Could not decode image.")
-
-    # Promote grayscale to 3-band BGR
     if img.ndim == 2:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-
-    # Keep RGB+NIR
     if img.ndim == 3 and img.shape[2] >= 4:
-        return img[:, :, :4]  # R,G,B,NIR
+        return img[:, :, :4]
     return img
 
 def compute_spectral_indices(img_4band: np.ndarray) -> dict:
-    """
-    Return NDVI, NDBI, SPSI and SPPI.
-    Input must be 4-band NAIP order: R,G,B,NIR.
-    """
     if img_4band.shape[2] < 4:
         raise ValueError("Need ≥4 bands to compute spectral indices.")
-
-    red   = img_4band[:, :, 0].astype(np.float32)
+    red = img_4band[:, :, 0].astype(np.float32)
     green = img_4band[:, :, 1].astype(np.float32)
-    blue  = img_4band[:, :, 2].astype(np.float32)
-    nir   = img_4band[:, :, 3].astype(np.float32)
-
-    # NDVI: Vegetation index
+    blue = img_4band[:, :, 2].astype(np.float32)
+    nir = img_4band[:, :, 3].astype(np.float32)
     ndvi = (nir - red) / (nir + red + 1e-7)
-
-    # NDBI: Built-up index (positive for built-up including solar panels)
     ndbi = (red - nir) / (red + nir + 1e-7)
-
-    # SPSI: Simple Solar Panel Spectral Index (custom)
     spsi = (red / (nir + 1.0)) - (blue / (green + 1.0))
-
-    # SPPI: Solar Photovoltaic Panel Index from the cited paper's principles
-    # Placeholder formula adapting their spectral peak (400-500 nm in blue channel)
-    # Here assumed as (blue / (nir + 1)) - (red / (green + 1)); adjust if band wavelengths known precisely
     sppi = (blue / (nir + 1.0)) - (red / (green + 1.0))
-
     return {"ndvi": ndvi, "ndbi": ndbi, "spsi": spsi, "sppi": sppi}
 
 def create_feature_stack(img_4band: np.ndarray) -> np.ndarray:
-    """
-    Build a 8-channel tensor: R,G,B,NIR,NDVI,NDBI,SPSI,SPPI
-    suitable for multispectral network training.
-    """
     idx = compute_spectral_indices(img_4band)
-    stack = np.stack(
-        [
-            img_4band[:, :, 0],      # R
-            img_4band[:, :, 1],      # G
-            img_4band[:, :, 2],      # B
-            img_4band[:, :, 3],      # NIR
-            idx["ndvi"],             # NDVI vegetation index
-            idx["ndbi"],             # NDBI built-up index
-            idx["spsi"],             # Solar Panel Spectral Index
-            idx["sppi"],             # Solar Photovoltaic Panel Index (SPPI)
-        ],
-        axis=2,
-    )
-    # Optional: normalize each band (mean/std) before training
+    stack = np.stack([
+        img_4band[:, :, 0], img_4band[:, :, 1], img_4band[:, :, 2], img_4band[:, :, 3],
+        idx["ndvi"], idx["ndbi"], idx["spsi"], idx["sppi"]
+    ], axis=2)
     return stack
 
 def encode_png(img_bgr: np.ndarray) -> bytes:
@@ -136,23 +87,33 @@ def encode_png(img_bgr: np.ndarray) -> bytes:
         raise RuntimeError("PNG encoding failed.")
     return buf.tobytes()
 
-# ───────────────────────────────
-# 4. Drawing & Post-processing
-# ───────────────────────────────
-def draw_detections(
-    img_bgr: np.ndarray,
-    polygons: List[np.ndarray],
-    boxes: Optional[np.ndarray],
-    confs: Optional[np.ndarray],
-    alpha: float = 0.35,
-) -> np.ndarray:
+# --------------- Geometry Utilities -----------------
+def lonlat_to_webmerc(lon: float, lat: float) -> Tuple[float, float]:
+    x = R_MAJOR * np.deg2rad(lon)
+    lat = max(min(lat, 85.05112878), -85.05112878)
+    y = R_MAJOR * np.log(np.tan(np.pi / 4.0 + np.deg2rad(lat) / 2.0))
+    return x, y
+
+def bbox4326_to_3857(min_lon, min_lat, max_lon, max_lat):
+    x1, y1 = lonlat_to_webmerc(min_lon, min_lat)
+    x2, y2 = lonlat_to_webmerc(max_lon, max_lat)
+    xmin, xmax = (x1, x2) if x1 <= x2 else (x2, x1)
+    ymin, ymax = (y1, y2) if y1 <= y2 else (y2, y1)
+    return xmin, ymin, xmax, ymax
+
+def webmerc_to_lonlat(x: float, y: float) -> Tuple[float, float]:
+    lon = np.rad2deg(x / R_MAJOR)
+    lat = np.rad2deg(2 * np.arctan(np.exp(y / R_MAJOR)) - np.pi / 2)
+    return lon, lat
+
+# --------------- Drawing/Detection Utils -----------------
+def draw_detections(img_bgr, polygons, boxes, confs, alpha=0.35):
     overlay = np.zeros_like(img_bgr)
     for poly in polygons:
         if poly is None or len(poly) < 3:
             continue
         cv2.fillPoly(overlay, [poly.astype(np.int32)], PANEL_COLOR)
     blended = cv2.addWeighted(img_bgr, 1 - alpha, overlay, alpha, 0)
-
     if boxes is not None:
         for i, box in enumerate(boxes):
             x1, y1, x2, y2 = [int(v) for v in box]
@@ -161,28 +122,16 @@ def draw_detections(
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             y1t = max(0, y1 - th - 6)
             cv2.rectangle(blended, (x1, y1t), (x1 + tw + 6, y1), BOX_COLOR, -1)
-            cv2.putText(
-                blended,
-                label,
-                (x1 + 3, y1 - 4),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                TEXT_COLOR,
-                2,
-                cv2.LINE_AA,
-            )
+            cv2.putText(blended, label, (x1 + 3, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_COLOR, 2, cv2.LINE_AA)
     return blended
 
 def filter_vegetation_false_positives(polygons, boxes, ndvi, threshold=0.3):
-    """
-    Remove detections whose average NDVI is high (likely vegetation).
-    """
     if boxes is None:
         return polygons, boxes
     keep_polys, keep_boxes = [], []
     for poly, box in zip(polygons, boxes):
         x1, y1, x2, y2 = [int(v) for v in box]
-        roi_ndvi = ndvi[max(y1, 0) : y2, max(x1, 0) : x2]
+        roi_ndvi = ndvi[max(y1, 0):y2, max(x1, 0):x2]
         if roi_ndvi.size == 0:
             continue
         if np.mean(roi_ndvi) < threshold:
@@ -191,48 +140,31 @@ def filter_vegetation_false_positives(polygons, boxes, ndvi, threshold=0.3):
     return keep_polys, np.array(keep_boxes) if keep_boxes else None
 
 def sharpen_image_rgb(img_rgb: np.ndarray) -> np.ndarray:
-    """Apply sharpening to RGB image using a kernel."""
-    kernel = np.array([[0, -1, 0],
-                       [-1, 5,-1],
-                       [0, -1, 0]])
-    sharp = cv2.filter2D(img_rgb, -1, kernel)
-    return sharp
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    return cv2.filter2D(img_rgb, -1, kernel)
 
-def yolo_infer_with_tta(model, img_rgb: np.ndarray, conf=0.25, iou=0.5, imgsz=1280):
-    """
-    Perform YOLO inference with test-time augmentation (TTA).
-    Returns combined polygon masks, boxes, confs.
-    """
-    augmentations = [lambda x: x,
-                     lambda x: cv2.flip(x, 1),  # horizontal flip
-                     lambda x: cv2.flip(x, 0)]  # vertical flip
-
+def yolo_infer_with_tta(model, img_rgb, conf=0.25, iou=0.5, imgsz=1280):
+    augmentations = [lambda x: x, lambda x: cv2.flip(x, 1), lambda x: cv2.flip(x, 0)]
     all_polygons = []
     all_boxes = []
     all_confs = []
-
     for aug in augmentations:
         aug_img = aug(img_rgb)
         results = model(aug_img, conf=conf, iou=iou, imgsz=imgsz, verbose=False)
         r = results[0]
-
-        # Reverse augmentation on output boxes and polygons
         if r.boxes is not None and r.boxes.xyxy is not None:
             boxes = r.boxes.xyxy.cpu().numpy()
             confs = r.boxes.conf.cpu().numpy() if r.boxes.conf is not None else None
-            # Flip boxes back if needed
-            if aug == augmentations[1]:  # horizontal flip
+            if aug == augmentations[1]:
                 boxes[:, [0, 2]] = img_rgb.shape[1] - boxes[:, [2, 0]]
-            elif aug == augmentations[2]:  # vertical flip
+            elif aug == augmentations[2]:
                 boxes[:, [1, 3]] = img_rgb.shape[0] - boxes[:, [3, 1]]
         else:
             boxes, confs = None, None
-
         polygons = []
         if r.masks is not None and hasattr(r.masks, "xy"):
             for poly in r.masks.xy:
                 p = np.array(poly)
-                # Flip polygons back
                 if aug == augmentations[1]:
                     p[:, 0] = img_rgb.shape[1] - p[:, 0]
                 elif aug == augmentations[2]:
@@ -243,18 +175,9 @@ def yolo_infer_with_tta(model, img_rgb: np.ndarray, conf=0.25, iou=0.5, imgsz=12
             all_boxes.extend(boxes)
         if confs is not None:
             all_confs.extend(confs)
-
-    # Optionally, apply Non-Max Suppression or merge results here
-    # For simplicity, returning concatenated detections
     all_boxes = np.array(all_boxes) if all_boxes else None
     all_confs = np.array(all_confs) if all_confs else None
-
     return all_polygons, all_boxes, all_confs
-
-def yolo_infer_rgb(img_bgr: np.ndarray, conf=0.25, iou=0.5, imgsz=1280):
-    """Run YOLO on RGB image and return result object."""
-    results = MODEL(img_bgr[:, :, :3], conf=conf, iou=iou, imgsz=imgsz, verbose=False)
-    return results[0]
 
 def polygons_from_masks(result) -> List[np.ndarray]:
     polys = []
@@ -268,40 +191,105 @@ def polygons_from_masks(result) -> List[np.ndarray]:
             polys.append(max(cnts, key=cv2.contourArea).reshape(-1, 2) if cnts else None)
     return polys
 
-# ───────────────────────────────
-# 6. FastAPI End-points
-# ───────────────────────────────
+# ------------ Imagery Fetchers -----------------
+def fetch_naip_bbox_mercator(xmin, ymin, xmax, ymax, width_px=1536):
+    url = "https://imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPImagery/ImageServer/exportImage"
+    w_m, h_m = xmax - xmin, ymax - ymin
+    width_px = int(max(256, min(3000, width_px)))
+    aspect = h_m / w_m
+    height_px = int(round(width_px * aspect))
+    height_px = max(256, min(3000, height_px))
+    params = {
+        "f": "image",
+        "bbox": f"{xmin},{ymin},{xmax},{ymax}",
+        "bboxSR": 3857, "imageSR": 3857,
+        "size": f"{width_px},{height_px}",
+        "format": "png",
+    }
+    resp = requests.get(url, params=params, timeout=30)
+    arr = np.frombuffer(resp.content, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise RuntimeError("NAIP image decoding failed")
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.ndim == 3 and img.shape[2] > 4:
+        img = img[:, :, :4]
+    mpp_x = w_m / img.shape[1]
+    mpp_y = h_m / img.shape[0]
+    return img, mpp_x, mpp_y
+
+def fetch_md_sixinch_bbox_mercator(xmin, ymin, xmax, ymax, width_px=1536):
+    url = "https://mdgeodata.md.gov/imagery/rest/services/SixInch/SixInchImagery/ImageServer/exportImage"
+    w_m = xmax - xmin
+    h_m = ymax - ymin
+    width_px = int(max(256, min(3500, width_px)))
+    aspect = h_m / w_m
+    height_px = int(round(width_px * aspect))
+    height_px = max(256, min(3500, height_px))
+    params = {
+        "f": "image",
+        "bbox": f"{xmin},{ymin},{xmax},{ymax}",
+        "bboxSR": 3857, "imageSR": 3857,
+        "size": f"{width_px},{height_px}",
+        "format": "png",
+    }
+    resp = requests.get(url, params=params, timeout=30)
+    arr = np.frombuffer(resp.content, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+    if img is None or img.shape[0] == 0 or img.shape[1] == 0:
+        raise RuntimeError("Maryland Six Inch image decoding failed")
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.ndim == 3 and img.shape[2] > 4:
+        img = img[:, :, :4]
+    mpp_x = w_m / img.shape[1]
+    mpp_y = h_m / img.shape[0]
+    return img, mpp_x, mpp_y
+
+def box_center_to_latlon(box, bbox_3857, img_shape):
+    xmin, ymin, xmax, ymax = bbox_3857
+    pixel_x_center = (box[0] + box[2]) / 2
+    pixel_y_center = (box[1] + box[3]) / 2
+    img_width = img_shape[1]
+    img_height = img_shape[0]
+    merc_x = xmin + (xmax - xmin) * (pixel_x_center / img_width)
+    merc_y = ymax - (ymax - ymin) * (pixel_y_center / img_height)
+    lon, lat = webmerc_to_lonlat(merc_x, merc_y)
+    return lat, lon
+
+# ------------ API Routes -----------------
 @app.get("/", response_class=HTMLResponse)
 def index():
     return FileResponse("static/index.html")
 
-@app.post("/infer")
-async def infer(
-    file: UploadFile = File(...),
+@app.post("/infer_imagery")
+async def infer_imagery(
+    service: str = Form("naip"),  # "naip" or "md"
+    min_lon: float = Form(...),
+    min_lat: float = Form(...),
+    max_lon: float = Form(...),
+    max_lat: float = Form(...),
+    width_px: int = Form(1536),
     conf: float = Form(0.25),
     iou: float = Form(0.5),
     imgsz: int = Form(1280),
-    ndvi_threshold: float = Form(0.3),          # vegetation filter
     sharpen: bool = Form(False),
     augment: bool = Form(False),
+    ndvi_threshold: float = Form(0.3),
 ):
-    """
-    Generic image inference (PNG/JPG/TIFF). If 4-band image is supplied,
-    NDVI vegetation filter is applied to suppress false positives.
-    Supports optional sharpening and test-time augmentation.
-    """
     try:
-        img_bytes = await file.read()
-        img = numpy_from_upload_multispectral(img_bytes)
-
-        # Compute NDVI for false positive filtering if possible
+        xmin, ymin, xmax, ymax = bbox4326_to_3857(min_lon, min_lat, max_lon, max_lat)
+        if service == "md":
+            img, mpp_x, mpp_y = fetch_md_sixinch_bbox_mercator(xmin, ymin, xmax, ymax, width_px)
+            imagery_source = "Maryland Six Inch"
+        else:
+            img, mpp_x, mpp_y = fetch_naip_bbox_mercator(xmin, ymin, xmax, ymax, width_px)
+            imagery_source = "NAIP"
         ndvi = compute_spectral_indices(img)["ndvi"] if img.shape[2] >= 4 else None
-
-        # Prepare RGB image for inference
         img_rgb = img[:, :, :3]
         if sharpen:
             img_rgb = sharpen_image_rgb(img_rgb)
-
         if augment:
             polygons, boxes, confs = yolo_infer_with_tta(MODEL, img_rgb, conf, iou, imgsz)
         else:
@@ -309,45 +297,42 @@ async def infer(
             polygons = polygons_from_masks(result)
             boxes = result.boxes.xyxy.cpu().numpy() if result.boxes.xyxy is not None else None
             confs = result.boxes.conf.cpu().numpy() if result.boxes.conf is not None else None
-
-        # Filter detections in high NDVI areas (vegetation false positives)
         if ndvi is not None and boxes is not None:
             polygons, boxes = filter_vegetation_false_positives(polygons, boxes, ndvi, threshold=ndvi_threshold)
             if boxes is None or len(boxes) == 0:
                 polygons, boxes, confs = [], None, None
-
         vis = draw_detections(img_rgb, polygons, boxes, confs)
         png = encode_png(vis)
         b64 = base64.b64encode(png).decode()
-        count = sum(1 for p in polygons if p is not None)
-
+        # Add detection list
+        detection_rows = []
+        if boxes is not None and confs is not None:
+            for i, box in enumerate(boxes):
+                lat, lon = box_center_to_latlon(box, (xmin, ymin, xmax, ymax), img.shape)
+                score = float(confs[i])
+                detection_rows.append({"lat": lat, "lon": lon, "score": score})
         return JSONResponse({
-            "count": count,
+            "count": sum(1 for p in polygons if p is not None),
             "image_data_url": f"data:image/png;base64,{b64}",
             "used_sharpen": sharpen,
             "used_augment": augment,
+            "imagery_source": imagery_source,
+            "mpp_x": mpp_x,
+            "mpp_y": mpp_y,
+            "export_bbox_3857": [xmin, ymin, xmax, ymax],
+            "detections": detection_rows,
         })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-# ───────────────────────────────
-# 7. Optional Endpoint: Return 8-channel Feature Stack (for training)
-# ───────────────────────────────
 @app.post("/extract_features")
 async def extract_features(file: UploadFile = File(...)):
-    """
-    Upload a 4-band image → return a zipped .npz file containing:
-    R, G, B, NIR, NDVI, NDBI, SPSI, and SPPI (8 bands).
-    Handy for training a custom multispectral YOLO model.
-    """
     try:
         img_bytes = await file.read()
         img = numpy_from_upload_multispectral(img_bytes)
         if img.shape[2] < 4:
             return JSONResponse({"error": "Need 4-band imagery to extract features."}, status_code=400)
-
         feat = create_feature_stack(img).astype(np.float32)
-        # Save to an in-memory buffer
         buf = io.BytesIO()
         np.savez_compressed(buf, features=feat)
         buf.seek(0)
@@ -355,6 +340,4 @@ async def extract_features(file: UploadFile = File(...)):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-# ───────────────────────────────
-# 8. Run via:  uvicorn hyperspectral_app_sp_pi:app --reload
-# ───────────────────────────────
+# Usage: uvicorn hyperspectral_app_sp_pi:app --reload
