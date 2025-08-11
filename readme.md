@@ -85,7 +85,8 @@ A web application that detects solar panels on residential homes using high-reso
 
 - **USGS NAIP**: https://imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPImagery/ImageServer
 - **USDA NAIP**: https://gis.apfo.usda.gov/arcgis/rest/services/NAIP/USDA_CONUS_PRIME/ImageServer
-- **Maryland Six Inch Imagery**: https://mdgeodata.md.gov/imagery/rest/services/SixInch/SixInchImagery/ImageServer
+- **Maryland Six Inch Imagery**: https://mdgeodata.md.gov/imagery/rest/services/SixInch/SixInchImagery/ImageServer  
+  *Note: Maryland Six Inch imagery is available only in Maryland. The interface validates bounding boxes to ensure selection within Maryland when this source is chosen.*
 
 ### Model
 
